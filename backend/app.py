@@ -829,6 +829,19 @@ def agent_action_result(action_id):
     config.log_audit("agent_action_result", request.agent_id,
                      {"action_id": action_id, "state": state},
                      success=(state == "success"))
+    # Stage 3: close the loop on player-management audit entries so the
+    # history shows the real outcome, not just "queued".
+    if str(action.get("action_type", "")).endswith(
+            ("_player", "whitelist_add", "whitelist_remove",
+             "whitelist_enable", "whitelist_disable",
+             "op_grant", "op_revoke")):
+        config.log_audit(
+            f"outcome_{action['action_type']}", request.agent_id,
+            {"action_id": action_id,
+             "target": (action.get("params") or {}).get("username"),
+             "state": state,
+             "error": data.get("error") or None},
+            success=(state == "success"))
     return result
 
 
@@ -984,3 +997,294 @@ def _max_players():
 
 if __name__ == "__main__":
     main()
+
+
+# =============================================================================
+# Stage 3 — Players, Moderation, Whitelist, Operators
+# =============================================================================
+# All player state comes from the agent's heartbeat snapshot, which the agent
+# builds by reading Paper's own files (usercache.json, whitelist.json,
+# banned-players.json, ops.json) and log lines. Nothing is fabricated; a
+# missing snapshot renders as "unavailable", not as empty success.
+#
+# Mutations are relayed like power actions: validated here, re-validated by
+# the agent, confirmed against Paper's files, audited with actor + target.
+
+from backend.validation import (
+    valid_username, sanitize_reason, validate_player_request
+)
+
+# Actor attribution: sessions carry the username that authenticated (Stage 1
+# single-admin auth). Deeper per-user attribution is not possible until the
+# auth system grows real accounts — see README limitations.
+
+STAGE3_MUTATIONS = {
+    "kick": ("kick_player", 10, 60),
+    "ban": ("ban_player", 10, 60),
+    "unban": ("unban_player", 10, 60),
+    "whitelist_add": ("whitelist_add", 10, 60),
+    "whitelist_remove": ("whitelist_remove", 10, 60),
+    "whitelist_enable": ("whitelist_enable", 5, 60),
+    "whitelist_disable": ("whitelist_disable", 5, 60),
+    "op_grant": ("op_grant", 5, 60),
+    "op_revoke": ("op_revoke", 5, 60),
+}
+
+
+def _stage3_mutation(kind, require_reason=False, require_admin=True,
+                     step_up=False):
+    """Build a validated, audited, relay-queued mutation endpoint body."""
+    action_type, max_req, window = STAGE3_MUTATIONS[kind]
+
+    data = request.json or {}
+    username, reason, err = validate_player_request(
+        data, require_reason=require_reason)
+    if err:
+        abort(400, {"error": err})
+
+    # Step-up auth: privilege changes require re-entering the admin
+    # password in the request body (defense against session hijack/CSRF
+    # on the most dangerous operations).
+    if step_up:
+        confirm = data.get("confirm_password")
+        if not confirm or not verify_secret(
+                confirm, config.ADMIN_PASSWORD_HASH or ""):
+            config.log_audit(f"player_{kind}", request.user_id,
+                             {"target": username, "reason": reason},
+                             success=False)
+            abort(403, {"error": "Privilege changes require admin password "
+                                 "confirmation"})
+
+    if require_admin:
+        _require_online_agent()
+    params = {"username": username}
+    if reason:
+        params["reason"] = reason
+
+    # Conflict guard: same action already in flight for same target
+    for a in command_handler.list_actions(20):
+        if (a["action_type"] == action_type
+                and a["state"] in ("pending", "running")
+                and a.get("params", {}).get("username") == username):
+            return {"status": "busy", "message": "Action already in progress",
+                    "action_id": a["action_id"], "state": a["state"]}
+
+    try:
+        action = command_handler.queue_for_agent(action_type, params)
+    except RuntimeError as e:
+        abort(429, {"error": str(e)})
+
+    config.log_audit(f"player_{kind}", request.user_id,
+                     {"target": username, "reason": reason or None,
+                      "action_id": action["action_id"]},
+                     success=False)  # outcome recorded when agent reports
+    return {"status": "queued", "message": f"{kind} queued for agent",
+            "action_id": action["action_id"], "state": action["state"],
+            "target": username}
+
+
+@app.route('/api/admin/players', method='GET')
+@require_user
+def players_list():
+    """Online players and full snapshot from the agent heartbeat."""
+    agents = agent_handler.get_all_agents_status()
+    online_agents = [a for a in agents
+                     if agent_handler.is_agent_online(a["agent_id"])]
+    agent = online_agents[0] if online_agents else None
+
+    snap = (agent or {}).get("player_snapshot")
+    snap_ts = (agent or {}).get("player_snapshot_ts")
+
+    if agent is None:
+        return {"available": False, "reason": "agent_offline",
+                "online": [], "count": 0}
+    if snap is None:
+        return {"available": False, "reason": "no_snapshot_yet",
+                "online": [], "count": 0,
+                "note": "Agent has not reported player data yet — "
+                        "wait for the next heartbeat."}
+
+    return {
+        "available": True,
+        "online": snap.get("online", []),
+        "count": len(snap.get("online", [])),
+        "snapshot_ts": snap_ts,
+        "agent_online": True,
+    }
+
+
+@app.route('/api/admin/players/bans', method='GET')
+@require_user
+def players_bans():
+    """Ban list from banned-players.json via the agent."""
+    agents = agent_handler.get_all_agents_status()
+    agent = next((a for a in agents
+                  if agent_handler.is_agent_online(a["agent_id"])), None)
+    snap = (agent or {}).get("player_snapshot")
+    if snap is None:
+        return {"available": False,
+                "reason": "agent_offline" if agent is None
+                          else "no_snapshot_yet",
+                "bans": []}
+    return {"available": True, "bans": snap.get("bans", []),
+            "snapshot_ts": snap.get("ts")}
+
+
+@app.route('/api/admin/whitelist', method='GET')
+@require_user
+def whitelist_get():
+    """Whitelist status + entries from whitelist.json via the agent."""
+    agents = agent_handler.get_all_agents_status()
+    agent = next((a for a in agents
+                  if agent_handler.is_agent_online(a["agent_id"])), None)
+    snap = (agent or {}).get("player_snapshot")
+    if snap is None:
+        return {"available": False,
+                "reason": "agent_offline" if agent is None
+                          else "no_snapshot_yet",
+                "enabled": None, "entries": []}
+    wl = snap.get("whitelist", {})
+    return {"available": True, "enabled": wl.get("enabled"),
+            "entries": wl.get("entries", []),
+            "snapshot_ts": snap.get("ts")}
+
+
+@app.route('/api/admin/operators', method='GET')
+@require_user
+def operators_get():
+    """Operator list from ops.json + LuckPerms detection."""
+    agents = agent_handler.get_all_agents_status()
+    agent = next((a for a in agents
+                  if agent_handler.is_agent_online(a["agent_id"])), None)
+    snap = (agent or {}).get("player_snapshot")
+    if snap is None:
+        return {"available": False,
+                "reason": "agent_offline" if agent is None
+                          else "no_snapshot_yet",
+                "operators": [],
+                "luckperms": {"installed": False, "operational": False}}
+    return {"available": True, "operators": snap.get("ops", []),
+            "luckperms": snap.get("luckperms",
+                                  {"installed": False, "operational": False}),
+            "snapshot_ts": snap.get("ts")}
+
+
+@app.route('/api/admin/players/history', method='GET')
+@require_user
+def players_history():
+    """RaheeCraft-recorded moderation history (from the audit log).
+
+    This is OUR history of dashboard actions, not the server's own —
+    presented as such. Search: ?username= filters by target.
+    """
+    username = request.query.username or None
+    if username and not valid_username(username):
+        abort(400, {"error": "Invalid username"})
+    entries = [
+        e for e in config.AUDIT_LOG
+        if str(e.get("action", "")).startswith("player_")
+    ]
+    if username:
+        entries = [
+            e for e in entries
+            if (e.get("details") or {}).get("target") == username
+        ]
+    return {"entries": entries[-200:], "source": "raheecraft_audit"}
+
+
+# --- Mutations (each queues a validated relay action) -----------------------
+
+@app.route('/api/admin/players/kick', method='POST')
+@require_admin
+@rate_limit(max_requests=10, window=60)
+def players_kick():
+    """Kick an online player with optional reason."""
+    return _stage3_mutation("kick")
+
+
+@app.route('/api/admin/players/ban', method='POST')
+@require_admin
+@rate_limit(max_requests=10, window=60)
+def players_ban():
+    """Ban a player (online or offline-known) with optional reason."""
+    return _stage3_mutation("ban")
+
+
+@app.route('/api/admin/players/unban', method='POST')
+@require_admin
+@rate_limit(max_requests=10, window=60)
+def players_unban():
+    """Remove a player from the ban list."""
+    return _stage3_mutation("unban")
+
+
+@app.route('/api/admin/whitelist/add', method='POST')
+@require_admin
+@rate_limit(max_requests=10, window=60)
+def whitelist_add():
+    """Add a player to the whitelist by username."""
+    return _stage3_mutation("whitelist_add")
+
+
+@app.route('/api/admin/whitelist/remove', method='POST')
+@require_admin
+@rate_limit(max_requests=10, window=60)
+def whitelist_remove():
+    """Remove a player from the whitelist."""
+    return _stage3_mutation("whitelist_remove")
+
+
+@app.route('/api/admin/whitelist/enable', method='POST')
+@require_admin
+@rate_limit(max_requests=5, window=60)
+def whitelist_enable():
+    """Enable the whitelist (destructive to joiners — audited)."""
+    return _stage3_mutation("whitelist_enable", require_admin=True)
+
+
+@app.route('/api/admin/whitelist/disable', method='POST')
+@require_admin
+@rate_limit(max_requests=5, window=60)
+def whitelist_disable():
+    """Disable the whitelist."""
+    return _stage3_mutation("whitelist_disable", require_admin=True)
+
+
+@app.route('/api/admin/operators', method='POST')
+@require_admin
+@rate_limit(max_requests=5, window=60)
+def operators_grant():
+    """Grant operator — requires admin password re-confirmation (step-up).
+
+    LuckPerms group management is NOT implemented here: if LuckPerms is
+    not detected as operational, the UI must show the unavailable state
+    rather than pretend a change happened.
+    """
+    return _stage3_mutation("op_grant", step_up=True)
+
+
+@app.route('/api/admin/operators/<username>', method='DELETE')
+@require_admin
+@rate_limit(max_requests=5, window=60)
+def operators_revoke(username):
+    """Revoke operator — requires admin password re-confirmation (step-up)."""
+    if not valid_username(username):
+        abort(400, {"error": "Invalid username"})
+    confirm = (request.json or {}).get("confirm_password")
+    if not confirm or not verify_secret(confirm,
+                                        config.ADMIN_PASSWORD_HASH or ""):
+        config.log_audit("player_op_revoke", request.user_id,
+                         {"target": username}, success=False)
+        abort(403, {"error": "Privilege changes require admin password "
+                             "confirmation"})
+    _require_online_agent()
+    try:
+        action = command_handler.queue_for_agent(
+            "op_revoke", {"username": username})
+    except RuntimeError as e:
+        abort(429, {"error": str(e)})
+    config.log_audit("player_op_revoke", request.user_id,
+                     {"target": username,
+                      "action_id": action["action_id"]}, success=False)
+    return {"status": "queued", "action_id": action["action_id"],
+            "state": action["state"], "target": username}

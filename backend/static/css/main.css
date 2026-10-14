@@ -1058,3 +1058,224 @@ a:hover {
     .action-buttons .btn { flex: 1 1 40%; }
     .toast { bottom: 76px; }
 }
+
+/* ==========================================================================
+   Stage 3 — Players, drawer, modal, entry lists
+   ========================================================================== */
+
+.count-badge {
+    display: inline-block;
+    min-width: 24px;
+    padding: 2px 8px;
+    margin-left: 6px;
+    border-radius: 12px;
+    background: rgba(59, 130, 246, 0.18);
+    color: #93c5fd;
+    font-size: 0.8rem;
+    text-align: center;
+    vertical-align: middle;
+}
+
+.table-wrap { overflow-x: auto; }
+
+.data-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.88rem;
+}
+
+.data-table th, .data-table td {
+    padding: 10px 12px;
+    text-align: left;
+    border-bottom: 1px solid var(--border, #334155);
+    white-space: nowrap;
+}
+
+.data-table th {
+    color: var(--text-muted, #94a3b8);
+    font-weight: 600;
+    font-size: 0.78rem;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+}
+
+.data-table td.mono {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 0.8rem;
+    color: var(--text-muted, #94a3b8);
+}
+
+.row-actions { display: flex; gap: 6px; flex-wrap: wrap; }
+
+.state-inline {
+    padding: 10px 14px;
+    border-radius: 8px;
+    margin-bottom: 12px;
+    font-size: 0.86rem;
+}
+.state-inline.warn {
+    background: rgba(245, 158, 11, 0.12);
+    border: 1px solid rgba(245, 158, 11, 0.35);
+    color: #fbbf24;
+}
+.state-inline.error {
+    background: rgba(239, 68, 68, 0.12);
+    border: 1px solid rgba(239, 68, 68, 0.35);
+    color: #fca5a5;
+}
+
+.inline-form {
+    display: flex;
+    gap: 8px;
+    margin-bottom: 12px;
+}
+.inline-form .console-input { flex: 1; }
+
+.entry-list { list-style: none; margin: 0; padding: 0; }
+
+.entry-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    padding: 8px 4px;
+    border-bottom: 1px solid var(--border, #334155);
+}
+.entry-row:last-child { border-bottom: none; }
+
+.entry-info { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.entry-info strong { font-size: 0.9rem; }
+.entry-sub {
+    font-size: 0.76rem;
+    color: var(--text-muted, #94a3b8);
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.hint-text {
+    font-size: 0.8rem;
+    color: var(--text-muted, #94a3b8);
+    margin: 4px 0 10px;
+}
+
+.lp-badge {
+    font-size: 0.75rem;
+    padding: 3px 10px;
+    border-radius: 12px;
+    background: rgba(148, 163, 184, 0.15);
+    color: var(--text-muted, #94a3b8);
+}
+.lp-badge.ok { background: rgba(34, 197, 94, 0.15); color: #86efac; }
+.lp-badge.warn { background: rgba(245, 158, 11, 0.15); color: #fbbf24; }
+
+.wl-status {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 0.82rem;
+    color: var(--text-muted, #94a3b8);
+}
+.wl-status .status-dot {
+    width: 8px; height: 8px; border-radius: 50%;
+    background: var(--text-muted, #94a3b8);
+}
+
+/* --- Player detail drawer ------------------------------------------------ */
+
+.drawer-backdrop, .modal-backdrop {
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.55);
+    z-index: 900;
+}
+
+.player-drawer {
+    position: fixed;
+    top: 0; right: 0; bottom: 0;
+    width: min(380px, 92vw);
+    background: var(--bg-card, #111827);
+    border-left: 1px solid var(--border, #334155);
+    z-index: 950;
+    display: flex;
+    flex-direction: column;
+    box-shadow: -12px 0 32px rgba(0, 0, 0, 0.4);
+    animation: drawerIn 0.18s ease-out;
+}
+
+@keyframes drawerIn {
+    from { transform: translateX(40px); opacity: 0; }
+    to { transform: translateX(0); opacity: 1; }
+}
+
+.drawer-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 16px 18px;
+    border-bottom: 1px solid var(--border, #334155);
+}
+.drawer-header h3 { margin: 0; font-size: 1.05rem; }
+
+.drawer-body { padding: 14px 18px; overflow-y: auto; }
+
+.drawer-row {
+    display: flex;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 8px 0;
+    border-bottom: 1px solid var(--border, #334155);
+    font-size: 0.86rem;
+}
+.drawer-label { color: var(--text-muted, #94a3b8); flex-shrink: 0; }
+.drawer-value {
+    text-align: right;
+    word-break: break-all;
+}
+
+/* --- Confirmation modal -------------------------------------------------- */
+
+.confirm-modal {
+    position: fixed;
+    top: 50%; left: 50%;
+    transform: translate(-50%, -50%);
+    width: min(420px, 92vw);
+    background: var(--bg-card, #111827);
+    border: 1px solid var(--border, #334155);
+    border-radius: 12px;
+    padding: 20px;
+    z-index: 960;
+    box-shadow: 0 20px 60px rgba(0, 0, 0, 0.5);
+}
+
+.confirm-modal h3 { margin: 0 0 8px; font-size: 1.05rem; }
+.confirm-modal p { margin: 0 0 14px; font-size: 0.88rem; color: var(--text-muted, #94a3b8); }
+
+.confirm-modal label {
+    display: block;
+    font-size: 0.8rem;
+    color: var(--text-muted, #94a3b8);
+    margin-bottom: 12px;
+}
+.confirm-modal label input {
+    display: block;
+    width: 100%;
+    margin-top: 4px;
+}
+
+.modal-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 10px;
+    margin-top: 6px;
+}
+
+/* --- Mobile players ------------------------------------------------------ */
+
+@media (max-width: 768px) {
+    .hide-mobile { display: none !important; }
+    .data-table th, .data-table td { padding: 8px 6px; font-size: 0.8rem; }
+    .row-actions { gap: 4px; }
+    .row-actions .btn { padding: 4px 8px; font-size: 0.72rem; }
+    .inline-form { flex-direction: column; }
+    .player-drawer { width: 100vw; }
+}

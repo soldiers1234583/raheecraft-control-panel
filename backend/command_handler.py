@@ -466,10 +466,10 @@ class CommandHandler:
         return action
     
     def get_action(self, action_id: str) -> Optional[Dict[str, Any]]:
-        """Get action status."""
+        """Get action status (including relay params/agent_id)."""
         action = self._get_action(action_id)
         if action:
-            return action.to_dict()
+            return _base_action_dict(action)
         return None
     
     def list_actions(self, limit: int = 50) -> List[Dict[str, Any]]:
@@ -479,7 +479,7 @@ class CommandHandler:
             key=lambda a: a.get("created_at", 0),
             reverse=True
         )
-        return [a.to_dict() for a in actions[:limit]]
+        return [_base_action_dict(a) for a in actions[:limit]]
     
     def cancel_action(self, action_id: str) -> bool:
         """Cancel a pending action."""
@@ -521,8 +521,15 @@ class ActionRelay:
     def queue_for_agent(self, action_type: str, params: dict,
                         agent_id: str = None) -> dict:
         """Create a pending action addressed to an agent. Rejects unknown types."""
-        if action_type not in ("start_server", "stop_server",
-                               "restart_server", "console_command"):
+        allowed = {
+            "start_server", "stop_server", "restart_server", "console_command",
+            # Stage 3 — player management (validated again by the agent)
+            "kick_player", "ban_player", "unban_player",
+            "whitelist_add", "whitelist_remove",
+            "whitelist_enable", "whitelist_disable",
+            "op_grant", "op_revoke",
+        }
+        if action_type not in allowed:
             raise ValueError(f"Unknown action type: {action_type}")
 
         # Reject duplicate in-flight actions of the same type

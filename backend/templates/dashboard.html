@@ -192,7 +192,7 @@
         
         <!-- Dashboard content -->
         <div id="dashboard-content" style="display: none;">
-            
+         <div id="overview-view">
             <!-- Server Power Card -->
             <section class="card server-status-card">
                 <div class="card-header">
@@ -422,7 +422,147 @@
                     </div>
                 </div>
             </section>
-            
+         </div><!-- /overview-view -->
+
+         <div id="players-view" style="display: none;">
+
+            <!-- Online Players -->
+            <section class="card players-card">
+                <div class="card-header">
+                    <h2>Online Players <span class="count-badge" id="players-count">0</span></h2>
+                    <div class="console-tools">
+                        <input type="search" id="players-search" class="console-search"
+                               placeholder="Search players..." aria-label="Search players">
+                        <button class="btn btn-secondary btn-sm" id="players-refresh">Refresh</button>
+                    </div>
+                </div>
+                <div class="card-body">
+                    <div id="players-state" class="state-inline" style="display:none;"></div>
+                    <div class="table-wrap">
+                        <table class="data-table" id="players-table">
+                            <thead>
+                                <tr>
+                                    <th>Player</th>
+                                    <th class="hide-mobile">UUID</th>
+                                    <th>Session</th>
+                                    <th class="hide-mobile">Status</th>
+                                    <th>Actions</th>
+                                </tr>
+                            </thead>
+                            <tbody id="players-tbody">
+                                <tr><td colspan="5" class="empty-state">Loading...</td></tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Whitelist -->
+            <section class="card whitelist-card">
+                <div class="card-header">
+                    <h2>Whitelist</h2>
+                    <div class="console-tools">
+                        <span class="wl-status" id="whitelist-status"><span class="status-dot"></span> -</span>
+                        <button class="btn btn-secondary btn-sm" id="whitelist-toggle">-</button>
+                    </div>
+                </div>
+                <div class="card-body">
+                    <form id="whitelist-add-form" autocomplete="off" class="inline-form">
+                        <input type="text" id="whitelist-add-input" class="console-input"
+                               placeholder="Username to add" maxlength="16" aria-label="Whitelist username">
+                        <button type="submit" class="btn btn-primary btn-sm">Add</button>
+                    </form>
+                    <ul class="entry-list" id="whitelist-entries">
+                        <li class="empty-state">Loading...</li>
+                    </ul>
+                </div>
+            </section>
+
+            <!-- Bans -->
+            <section class="card bans-card">
+                <div class="card-header">
+                    <h2>Banned Players <span class="count-badge" id="bans-count">0</span></h2>
+                    <button class="btn btn-secondary btn-sm" id="bans-refresh">Refresh</button>
+                </div>
+                <div class="card-body">
+                    <ul class="entry-list" id="bans-list">
+                        <li class="empty-state">Loading...</li>
+                    </ul>
+                </div>
+            </section>
+
+            <!-- Operators & Permissions -->
+            <section class="card ops-card">
+                <div class="card-header">
+                    <h2>Operators</h2>
+                    <span class="lp-badge" id="luckperms-badge">LuckPerms: checking...</span>
+                </div>
+                <div class="card-body">
+                    <p class="hint-text" id="luckperms-hint" style="display:none;">
+                        LuckPerms is not installed on this server, so permission groups
+                        cannot be managed here. To use groups, install the LuckPerms
+                        plugin into your server's <code>plugins/</code> folder and restart.
+                        Operator (op/deop) management below works without LuckPerms.
+                    </p>
+                    <form id="op-grant-form" autocomplete="off" class="inline-form">
+                        <input type="text" id="op-grant-input" class="console-input"
+                               placeholder="Username to promote" maxlength="16" aria-label="Operator username">
+                        <button type="submit" class="btn btn-primary btn-sm">Grant OP</button>
+                    </form>
+                    <ul class="entry-list" id="ops-list">
+                        <li class="empty-state">Loading...</li>
+                    </ul>
+                </div>
+            </section>
+
+            <!-- Moderation History (RaheeCraft-recorded) -->
+            <section class="card history-card">
+                <div class="card-header">
+                    <h2>Moderation History</h2>
+                    <span class="hint-text">Actions taken from this dashboard</span>
+                </div>
+                <div class="card-body">
+                    <ul class="entry-list" id="history-list">
+                        <li class="empty-state">No moderation actions recorded</li>
+                    </ul>
+                </div>
+            </section>
+
+         </div><!-- /players-view -->
+
+        </div><!-- /dashboard-content -->
+
+        <!-- Player detail drawer -->
+        <div class="drawer-backdrop" id="player-drawer-backdrop" style="display:none;"></div>
+        <aside class="player-drawer" id="player-drawer" style="display:none;" aria-label="Player details">
+            <div class="drawer-header">
+                <h3 id="drawer-name">Player</h3>
+                <button class="btn-icon" id="drawer-close" aria-label="Close details">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>
+                    </svg>
+                </button>
+            </div>
+            <div class="drawer-body" id="drawer-body"></div>
+        </aside>
+
+        <!-- Confirmation modal (kick/ban/op with reason) -->
+        <div class="modal-backdrop" id="modal-backdrop" style="display:none;"></div>
+        <div class="confirm-modal" id="confirm-modal" style="display:none;" role="dialog" aria-modal="true">
+            <h3 id="modal-title">Confirm</h3>
+            <p id="modal-message"></p>
+            <label id="modal-reason-label" for="modal-reason" style="display:none;">
+                Reason (optional)
+                <input type="text" id="modal-reason" maxlength="100" class="console-input">
+            </label>
+            <label id="modal-password-label" for="modal-password" style="display:none;">
+                Admin password (required for privilege changes)
+                <input type="password" id="modal-password" class="console-input" autocomplete="off">
+            </label>
+            <div class="modal-actions">
+                <button class="btn btn-secondary" id="modal-cancel">Cancel</button>
+                <button class="btn btn-danger" id="modal-confirm">Confirm</button>
+            </div>
         </div>
     </main>
     

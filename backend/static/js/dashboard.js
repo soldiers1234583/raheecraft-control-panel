@@ -31,6 +31,7 @@ const Dashboard = {
         this.setupNavigation();
         this.setupActions();
         this.setupConsole();
+        this.setupPlayers();
         this.startPolling();
     },
 
@@ -62,6 +63,8 @@ const Dashboard = {
             el.addEventListener('click', (e) => { e.preventDefault(); this.switchSection('overview'); }));
         document.querySelectorAll('.mob-nav-console').forEach(el =>
             el.addEventListener('click', (e) => { e.preventDefault(); this.switchSection('console'); }));
+        document.querySelectorAll('.mob-nav-players').forEach(el =>
+            el.addEventListener('click', (e) => { e.preventDefault(); this.switchSection('players'); }));
 
         document.getElementById('menuToggle')?.addEventListener('click', () => {
             document.getElementById('sidebar').classList.toggle('closed');
@@ -81,6 +84,22 @@ const Dashboard = {
         document.querySelectorAll('.nav-item[data-section]').forEach(item => {
             item.classList.toggle('active', item.dataset.section === section);
         });
+
+        // Toggle real view containers (Stage 3)
+        const overview = document.getElementById('overview-view');
+        const players = document.getElementById('players-view');
+        if (overview && players) {
+            const toPlayers = section === 'players';
+            overview.style.display = toPlayers ? 'none' : 'block';
+            players.style.display = toPlayers ? 'block' : 'none';
+            if (toPlayers) {
+                this.refreshPlayers();
+                this.refreshWhitelist();
+                this.refreshBans();
+                this.refreshOperators();
+                this.refreshHistory();
+            }
+        }
 
         const consoleCard = document.getElementById('section-console');
         if (consoleCard) {
@@ -311,6 +330,15 @@ const Dashboard = {
         this.refreshInterval = setInterval(() => this.fetchStatus(), 15000);
         this.monitorInterval = setInterval(() => this.fetchMonitoring(), 10000);
         this.consoleInterval = setInterval(() => this.fetchConsole(), 3000);
+        // Stage 3: refresh player data only while the Players section is open
+        this.playersInterval = setInterval(() => {
+            if (this.currentSection === 'players') {
+                this.refreshPlayers();
+                this.refreshWhitelist();
+                this.refreshBans();
+                this.refreshOperators();
+            }
+        }, 20000);
 
         this.fetchStatus();
         this.fetchMonitoring();
@@ -709,6 +737,603 @@ const Dashboard = {
         if (!timestamp) return '-';
         const date = new Date(timestamp * 1000);
         return date.toLocaleTimeString();
+    },
+
+
+    // =====================================================================
+    // Stage 3 — Players, moderation, whitelist, operators
+    // =====================================================================
+
+    setupPlayers() {
+        const search = document.getElementById('players-search');
+        let t = null;
+        search?.addEventListener('input', () => {
+            clearTimeout(t);
+            t = setTimeout(() => this.renderPlayers(), 250);
+        });
+
+        document.getElementById('players-refresh')?.addEventListener('click', () => {
+            this.refreshPlayers();
+            this.showMessage('info', 'Player list refreshed');
+        });
+        document.getElementById('bans-refresh')?.addEventListener('click', () => {
+            this.refreshBans();
+        });
+
+        // Whitelist toggle (confirmation for the destructive direction)
+        document.getElementById('whitelist-toggle')?.addEventListener('click', () => {
+            const btn = document.getElementById('whitelist-toggle');
+            const enabling = btn?.dataset.action === 'enable';
+            const label = enabling ? 'enable' : 'disable';
+            if (!confirm(`Really ${label} the whitelist?`)) return;
+            this.playerMutation(enabling ? 'whitelist/enable' : 'whitelist/disable', {},
+                `${label === 'enable' ? 'Whitelist enabled' : 'Whitelist disabled'}`);
+        });
+
+        // Whitelist add form
+        document.getElementById('whitelist-add-form')?.addEventListener('submit', (e) => {
+            e.preventDefault();
+            const input = document.getElementById('whitelist-add-input');
+            const username = (input?.value || '').trim();
+            if (!username) return;
+            this.playerMutation('whitelist/add', { username },
+                `${username} added to whitelist`, input);
+        });
+
+        // OP grant (step-up: modal asks for admin password)
+        document.getElementById('op-grant-form')?.addEventListener('submit', (e) => {
+            e.preventDefault();
+            const input = document.getElementById('op-grant-input');
+            const username = (input?.value || '').trim();
+            if (!username) return;
+            this.confirmModal({
+                title: `Grant operator to ${username}?`,
+                message: 'Operator privileges allow full server control. This requires your admin password.',
+                showPassword: true,
+                danger: true,
+            }).then((res) => {
+                if (!res) return;
+                this.playerMutation('operators', {
+                    username, confirm_password: res.password,
+                }, `${username} is now an operator`, input);
+            });
+        });
+
+        // Drawer close
+        document.getElementById('drawer-close')?.addEventListener('click',
+            () => this.closeDrawer());
+        document.getElementById('player-drawer-backdrop')?.addEventListener('click',
+            () => this.closeDrawer());
+        document.addEventListener('keydown', (e) => {
+            if (e.key === 'Escape') this.closeDrawer();
+        });
+    },
+
+    /** Generic player mutation with pending state, toasts, and refresh. */
+    async playerMutation(path, body, successMsg, clearInput) {
+        try {
+            const resp = await fetch(`${this.API_BASE}/admin/${path}`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(body),
+            });
+            const data = await resp.json().catch(() => ({}));
+            if (!resp.ok) {
+                this.showMessage('error', data.error || `Request failed (${resp.status})`);
+                return null;
+            }
+            if (data.status === 'busy') {
+                this.showMessage('info', data.message || 'Already in progress');
+                return data;
+            }
+            if (data.status === 'queued') {
+                if (clearInput) clearInput.value = '';
+                this.showMessage('info', `${data.target}: queued for agent...`);
+                this.watchPlayerAction(data.action_id, successMsg);
+                return data;
+            }
+            return data;
+        } catch (e) {
+            this.showMessage('error', 'Backend unreachable');
+            return null;
+        }
+    },
+
+    /** Poll a player action to its terminal state; toast + refresh on done. */
+    watchPlayerAction(actionId, successMsg) {
+        let tries = 0;
+        const timer = setInterval(async () => {
+            tries++;
+            if (tries > 45) {
+                clearInterval(timer);
+                this.showMessage('error', 'Action timed out waiting for agent');
+                return;
+            }
+            try {
+                const resp = await fetch(`${this.API_BASE}/admin/server/actions/${actionId}`);
+                if (!resp.ok) return;
+                const action = await resp.json();
+                if (action.state === 'success') {
+                    clearInterval(timer);
+                    const note = action.result?.note;
+                    this.showMessage('success', note ? `${successMsg} (${note})` : successMsg);
+                    this.refreshPlayers();
+                    this.refreshWhitelist();
+                    this.refreshBans();
+                    this.refreshOperators();
+                    this.refreshHistory();
+                } else if (['failed', 'timeout', 'cancelled'].includes(action.state)) {
+                    clearInterval(timer);
+                    this.showMessage('error', action.error || `Action ${action.state}`);
+                    this.refreshPlayers();
+                    this.refreshWhitelist();
+                    this.refreshBans();
+                    this.refreshOperators();
+                    this.refreshHistory();
+                }
+            } catch (e) { /* keep trying */ }
+        }, 2000);
+    },
+
+    async refreshPlayers() {
+        const tbody = document.getElementById('players-tbody');
+        const stateEl = document.getElementById('players-state');
+        try {
+            const resp = await fetch(`${this.API_BASE}/admin/players`);
+            if (resp.status === 401) { window.location.href = '/login'; return; }
+            const data = await resp.json();
+            if (!data.available) {
+                if (stateEl) {
+                    stateEl.style.display = 'block';
+                    stateEl.className = 'state-inline warn';
+                    stateEl.textContent = data.reason === 'agent_offline'
+                        ? 'Agent is offline — start the Kaggle notebook to see players.'
+                        : 'Waiting for the first player snapshot from the agent...';
+                }
+                if (tbody) tbody.innerHTML =
+                    '<tr><td colspan="5" class="empty-state">No data</td></tr>';
+                const badge = document.getElementById('players-count');
+                if (badge) badge.textContent = '-';
+                return;
+            }
+            if (stateEl) stateEl.style.display = 'none';
+            this._playerSnapshot = data;
+            this.renderPlayers();
+        } catch (e) {
+            if (stateEl) {
+                stateEl.style.display = 'block';
+                stateEl.className = 'state-inline error';
+                stateEl.textContent = 'Backend unreachable';
+            }
+        }
+    },
+
+    renderPlayers() {
+        const data = this._playerSnapshot;
+        const tbody = document.getElementById('players-tbody');
+        const badge = document.getElementById('players-count');
+        if (!tbody) return;
+        if (!data || !data.available) return;
+
+        const q = (document.getElementById('players-search')?.value || '')
+            .trim().toLowerCase();
+        const players = (data.online || []).filter(
+            p => !q || (p.username || '').toLowerCase().includes(q));
+
+        if (badge) badge.textContent = String(data.count ?? players.length);
+
+        if (players.length === 0) {
+            tbody.innerHTML = q
+                ? '<tr><td colspan="5" class="empty-state">No players match the search</td></tr>'
+                : '<tr><td colspan="5" class="empty-state">No players online</td></tr>';
+            return;
+        }
+
+        tbody.innerHTML = '';
+        players.forEach(p => {
+            const tr = document.createElement('tr');
+            const nameTd = document.createElement('td');
+            nameTd.textContent = p.username || '(unknown)';
+
+            const uuidTd = document.createElement('td');
+            uuidTd.className = 'mono hide-mobile';
+            uuidTd.textContent = p.uuid ? p.uuid.slice(0, 13) + '\u2026' : 'n/a';
+            uuidTd.title = p.uuid || '';
+
+            const sessTd = document.createElement('td');
+            sessTd.textContent = p.session_seconds != null
+                ? this.formatUptime(p.session_seconds) : 'unknown';
+
+            const statTd = document.createElement('td');
+            statTd.className = 'hide-mobile';
+            statTd.innerHTML = '<span class="status-dot" style="background: var(--success)"></span> Online';
+
+            const actTd = document.createElement('td');
+            actTd.className = 'row-actions';
+
+            const detailBtn = document.createElement('button');
+            detailBtn.className = 'btn btn-secondary btn-sm';
+            detailBtn.textContent = 'Details';
+            detailBtn.addEventListener('click', () => this.openDrawer(p));
+
+            const kickBtn = document.createElement('button');
+            kickBtn.className = 'btn btn-secondary btn-sm';
+            kickBtn.textContent = 'Kick';
+            kickBtn.addEventListener('click', () => {
+                this.confirmModal({
+                    title: `Kick ${p.username}?`,
+                    message: 'The player will be disconnected. They can rejoin unless banned.',
+                    showReason: true, danger: true,
+                }).then((res) => {
+                    if (!res) return;
+                    this.playerMutation('players/kick',
+                        { username: p.username, reason: res.reason },
+                        `${p.username} kicked`);
+                });
+            });
+
+            const banBtn = document.createElement('button');
+            banBtn.className = 'btn btn-danger btn-sm';
+            banBtn.textContent = 'Ban';
+            banBtn.addEventListener('click', () => {
+                this.confirmModal({
+                    title: `Ban ${p.username}?`,
+                    message: 'The player will be disconnected and cannot rejoin until unbanned.',
+                    showReason: true, danger: true,
+                }).then((res) => {
+                    if (!res) return;
+                    this.playerMutation('players/ban',
+                        { username: p.username, reason: res.reason },
+                        `${p.username} banned`);
+                });
+            });
+
+            actTd.append(detailBtn, kickBtn, banBtn);
+            tr.append(nameTd, uuidTd, sessTd, statTd, actTd);
+            tbody.appendChild(tr);
+        });
+    },
+
+    async refreshWhitelist() {
+        const statusEl = document.getElementById('whitelist-status');
+        const toggleBtn = document.getElementById('whitelist-toggle');
+        const list = document.getElementById('whitelist-entries');
+        try {
+            const resp = await fetch(`${this.API_BASE}/admin/whitelist`);
+            const data = await resp.json();
+            if (!data.available) {
+                if (statusEl) statusEl.innerHTML =
+                    '<span class="status-dot" style="background: var(--text-muted)"></span> unavailable';
+                if (toggleBtn) toggleBtn.disabled = true;
+                if (list) list.innerHTML =
+                    '<li class="empty-state">Agent offline — no whitelist data</li>';
+                return;
+            }
+            if (statusEl) {
+                statusEl.innerHTML = data.enabled
+                    ? '<span class="status-dot" style="background: var(--success)"></span> Enabled'
+                    : '<span class="status-dot" style="background: var(--text-muted)"></span> Disabled';
+            }
+            if (toggleBtn) {
+                toggleBtn.disabled = false;
+                toggleBtn.textContent = data.enabled ? 'Disable' : 'Enable';
+                toggleBtn.dataset.action = data.enabled ? 'disable' : 'enable';
+                toggleBtn.className = data.enabled
+                    ? 'btn btn-danger btn-sm' : 'btn btn-secondary btn-sm';
+            }
+            if (list) {
+                list.innerHTML = '';
+                const entries = data.entries || [];
+                if (entries.length === 0) {
+                    list.innerHTML = '<li class="empty-state">Whitelist is empty</li>';
+                } else {
+                    entries.forEach(e => {
+                        const li = document.createElement('li');
+                        li.className = 'entry-row';
+                        const name = document.createElement('span');
+                        name.textContent = e.username;
+                        const rm = document.createElement('button');
+                        rm.className = 'btn btn-secondary btn-sm';
+                        rm.textContent = 'Remove';
+                        rm.addEventListener('click', () => {
+                            if (!confirm(`Remove ${e.username} from the whitelist?`)) return;
+                            this.playerMutation('whitelist/remove',
+                                { username: e.username },
+                                `${e.username} removed from whitelist`);
+                        });
+                        li.append(name, rm);
+                        list.appendChild(li);
+                    });
+                }
+            }
+        } catch (e) { /* status handled elsewhere */ }
+    },
+
+    async refreshBans() {
+        const list = document.getElementById('bans-list');
+        const badge = document.getElementById('bans-count');
+        try {
+            const resp = await fetch(`${this.API_BASE}/admin/players/bans`);
+            const data = await resp.json();
+            if (badge) badge.textContent = data.available ? String((data.bans || []).length) : '-';
+            if (!list) return;
+            if (!data.available) {
+                list.innerHTML = '<li class="empty-state">Agent offline — no ban data</li>';
+                return;
+            }
+            list.innerHTML = '';
+            const bans = data.bans || [];
+            if (bans.length === 0) {
+                list.innerHTML = '<li class="empty-state">No banned players</li>';
+                return;
+            }
+            bans.forEach(b => {
+                const li = document.createElement('li');
+                li.className = 'entry-row';
+                const info = document.createElement('div');
+                info.className = 'entry-info';
+                const name = document.createElement('strong');
+                name.textContent = b.username || (b.uuid ? b.uuid.slice(0, 13) + '\u2026' : '(unknown)');
+                const reason = document.createElement('span');
+                reason.className = 'entry-sub';
+                reason.textContent = b.reason || 'No reason';
+                info.append(name, reason);
+                const unban = document.createElement('button');
+                unban.className = 'btn btn-secondary btn-sm';
+                unban.textContent = 'Unban';
+                unban.addEventListener('click', () => {
+                    const target = b.username || b.uuid;
+                    if (!target || !b.username) {
+                        this.showMessage('error',
+                            'This ban has no cached username — unban by UUID is not supported here');
+                        return;
+                    }
+                    if (!confirm(`Unban ${b.username}?`)) return;
+                    this.playerMutation('players/unban', { username: b.username },
+                        `${b.username} unbanned`);
+                });
+                li.append(info, unban);
+                list.appendChild(li);
+            });
+        } catch (e) { /* handled */ }
+    },
+
+    async refreshOperators() {
+        const list = document.getElementById('ops-list');
+        const lpBadge = document.getElementById('luckperms-badge');
+        const lpHint = document.getElementById('luckperms-hint');
+        try {
+            const resp = await fetch(`${this.API_BASE}/admin/operators`);
+            const data = await resp.json();
+            const lp = data.luckperms || {};
+            if (lpBadge) {
+                if (!data.available) {
+                    lpBadge.textContent = 'LuckPerms: unknown (agent offline)';
+                } else if (lp.operational) {
+                    lpBadge.textContent = `LuckPerms: operational${lp.version ? ' v' + lp.version : ''}`;
+                    lpBadge.className = 'lp-badge ok';
+                } else if (lp.installed) {
+                    lpBadge.textContent = 'LuckPerms: installed but not confirmed running';
+                    lpBadge.className = 'lp-badge warn';
+                } else {
+                    lpBadge.textContent = 'LuckPerms: not installed';
+                    lpBadge.className = 'lp-badge';
+                }
+            }
+            if (lpHint) lpHint.style.display =
+                (data.available && !lp.installed) ? 'block' : 'none';
+            if (!list) return;
+            if (!data.available) {
+                list.innerHTML = '<li class="empty-state">Agent offline — no operator data</li>';
+                return;
+            }
+            list.innerHTML = '';
+            const ops = data.operators || [];
+            if (ops.length === 0) {
+                list.innerHTML = '<li class="empty-state">No operators</li>';
+                return;
+            }
+            ops.forEach(o => {
+                const li = document.createElement('li');
+                li.className = 'entry-row';
+                const info = document.createElement('div');
+                info.className = 'entry-info';
+                const name = document.createElement('strong');
+                name.textContent = o.username || (o.uuid ? o.uuid.slice(0, 13) + '\u2026' : '(unknown)');
+                const sub = document.createElement('span');
+                sub.className = 'entry-sub';
+                sub.textContent = `level ${o.level ?? 'n/a'}`;
+                info.append(name, sub);
+                const rm = document.createElement('button');
+                rm.className = 'btn btn-danger btn-sm';
+                rm.textContent = 'Revoke OP';
+                if (!o.username) rm.disabled = true;
+                rm.addEventListener('click', () => {
+                    this.confirmModal({
+                        title: `Revoke operator from ${o.username}?`,
+                        message: 'They will lose all operator privileges. Requires your admin password.',
+                        showPassword: true, danger: true,
+                    }).then((res) => {
+                        if (!res) return;
+                        this.playerMutationRaw('DELETE',
+                            `operators/${o.username}`,
+                            { confirm_password: res.password },
+                            `${o.username} is no longer an operator`);
+                    });
+                });
+                li.append(info, rm);
+                list.appendChild(li);
+            });
+        } catch (e) { /* handled */ }
+    },
+
+    /** DELETE helper for op revoke. */
+    async playerMutationRaw(method, path, body, successMsg) {
+        try {
+            const resp = await fetch(`${this.API_BASE}/admin/${path}`, {
+                method,
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(body),
+            });
+            const data = await resp.json().catch(() => ({}));
+            if (!resp.ok) {
+                this.showMessage('error', data.error || 'Request failed');
+                return null;
+            }
+            this.showMessage('info', `${data.target}: queued for agent...`);
+            this.watchPlayerAction(data.action_id, successMsg);
+            return data;
+        } catch (e) {
+            this.showMessage('error', 'Backend unreachable');
+            return null;
+        }
+    },
+
+    async refreshHistory() {
+        const list = document.getElementById('history-list');
+        if (!list) return;
+        try {
+            const resp = await fetch(`${this.API_BASE}/admin/players/history`);
+            const data = await resp.json();
+            list.innerHTML = '';
+            const entries = (data.entries || []).slice(-30).reverse();
+            if (entries.length === 0) {
+                list.innerHTML = '<li class="empty-state">No moderation actions recorded</li>';
+                return;
+            }
+            entries.forEach(e => {
+                const li = document.createElement('li');
+                li.className = 'entry-row';
+                const info = document.createElement('div');
+                info.className = 'entry-info';
+                const main = document.createElement('strong');
+                const d = e.details || {};
+                main.textContent = `${e.action.replace(/^player_/, '').replace(/^outcome_/, '')} \u2192 ${d.target || '?'}`;
+                const sub = document.createElement('span');
+                sub.className = 'entry-sub';
+                const when = new Date(e.timestamp * 1000).toLocaleString();
+                sub.textContent = `${when} \u00b7 by ${e.user_id} \u00b7 ` +
+                    (e.success ? 'success' : (d.state || 'requested')) +
+                    (d.reason ? ` \u00b7 "${d.reason}"` : '') +
+                    (d.error ? ` \u00b7 ${d.error}` : '');
+                info.append(main, sub);
+                li.appendChild(info);
+                list.appendChild(li);
+            });
+        } catch (e) { /* handled */ }
+    },
+
+    // --- Player detail drawer ---------------------------------------------
+
+    openDrawer(player) {
+        const drawer = document.getElementById('player-drawer');
+        const backdrop = document.getElementById('player-drawer-backdrop');
+        const nameEl = document.getElementById('drawer-name');
+        const body = document.getElementById('drawer-body');
+        if (!drawer || !body) return;
+
+        nameEl.textContent = player.username || 'Player';
+        body.innerHTML = '';
+
+        const rows = [
+            ['Username', player.username || 'n/a'],
+            ['UUID', player.uuid || 'unknown (not in usercache yet)'],
+            ['Online', 'Yes'],
+            ['Session started', player.session_started_at
+                ? new Date(player.session_started_at * 1000).toLocaleString()
+                : 'unknown (agent started after join)'],
+            ['Session length', player.session_seconds != null
+                ? this.formatUptime(player.session_seconds) : 'unknown'],
+        ];
+        // operator/whitelist state from the cached snapshot if present
+        const snap = this._operatorSnapshot;
+        if (snap) {
+            rows.push(['Operator', (snap.operators || []).some(
+                o => o.username === player.username) ? 'Yes' : 'No']);
+            rows.push(['Whitelisted', (snap.whitelistEntries || []).some(
+                e => e.username === player.username) ? 'Yes' : 'No']);
+        }
+
+        rows.forEach(([label, value]) => {
+            const row = document.createElement('div');
+            row.className = 'drawer-row';
+            const l = document.createElement('span');
+            l.className = 'drawer-label';
+            l.textContent = label;
+            const v = document.createElement('span');
+            v.className = 'drawer-value';
+            v.textContent = value;
+            row.append(l, v);
+            body.appendChild(row);
+        });
+
+        // Note about stats/first-seen: honest unavailability
+        const note = document.createElement('p');
+        note.className = 'hint-text';
+        note.textContent = 'Statistics and first-seen times are not exposed by ' +
+            'Paper without additional plugins, so they are not shown.';
+        body.appendChild(note);
+
+        drawer.style.display = 'block';
+        backdrop.style.display = 'block';
+    },
+
+    closeDrawer() {
+        const drawer = document.getElementById('player-drawer');
+        const backdrop = document.getElementById('player-drawer-backdrop');
+        if (drawer) drawer.style.display = 'none';
+        if (backdrop) backdrop.style.display = 'none';
+    },
+
+    // --- Confirmation modal ------------------------------------------------
+
+    /**
+     * Promise-based confirm modal.
+     * opts: {title, message, showReason, showPassword, danger}
+     * Resolves {reason, password} or null on cancel.
+     */
+    confirmModal(opts) {
+        return new Promise((resolve) => {
+            const modal = document.getElementById('confirm-modal');
+            const backdrop = document.getElementById('modal-backdrop');
+            if (!modal) { resolve(null); return; }
+
+            document.getElementById('modal-title').textContent = opts.title || 'Confirm';
+            document.getElementById('modal-message').textContent = opts.message || '';
+            const reasonLabel = document.getElementById('modal-reason-label');
+            const pwLabel = document.getElementById('modal-password-label');
+            const reasonInput = document.getElementById('modal-reason');
+            const pwInput = document.getElementById('modal-password');
+            reasonLabel.style.display = opts.showReason ? 'block' : 'none';
+            pwLabel.style.display = opts.showPassword ? 'block' : 'none';
+            reasonInput.value = '';
+            pwInput.value = '';
+            const confirmBtn = document.getElementById('modal-confirm');
+            const cancelBtn = document.getElementById('modal-cancel');
+            confirmBtn.className = opts.danger ? 'btn btn-danger' : 'btn btn-primary';
+
+            modal.style.display = 'block';
+            backdrop.style.display = 'block';
+            (opts.showPassword ? pwInput : (opts.showReason ? reasonInput : confirmBtn))?.focus();
+
+            const cleanup = (result) => {
+                modal.style.display = 'none';
+                backdrop.style.display = 'none';
+                confirmBtn.removeEventListener('click', onConfirm);
+                cancelBtn.removeEventListener('click', onCancel);
+                backdrop.removeEventListener('click', onCancel);
+                resolve(result);
+            };
+            const onConfirm = () => cleanup({
+                reason: reasonInput.value.trim() || undefined,
+                password: pwInput.value || undefined,
+            });
+            const onCancel = () => cleanup(null);
+
+            confirmBtn.addEventListener('click', onConfirm);
+            cancelBtn.addEventListener('click', onCancel);
+            backdrop.addEventListener('click', onCancel);
+        });
     },
 
     formatUptime(seconds) {

@@ -34,7 +34,8 @@ class AgentHandler:
             "cpu_percent": None,
             "memory_percent": None,
             "player_count": None,
-            "uptime_seconds": 0
+            "uptime_seconds": 0,
+            "player_snapshot": None
         }
         return True
     
@@ -87,6 +88,12 @@ class AgentHandler:
             agent["player_count"] = status["player_count"]
         if "uptime_seconds" in status:
             agent["uptime_seconds"] = status["uptime_seconds"]
+        # Stage 3: player snapshot (online/whitelist/bans/ops/luckperms).
+        # Caps enforced so a rogue agent cannot balloon backend memory.
+        if isinstance(status.get("player_snapshot"), dict):
+            agent["player_snapshot"] = _sanitize_snapshot(
+                status["player_snapshot"])
+            agent["player_snapshot_ts"] = status["player_snapshot"].get("ts")
         
         return True
     
@@ -110,6 +117,8 @@ class AgentHandler:
             "memory_percent": agent["memory_percent"],
             "player_count": agent["player_count"],
             "uptime_seconds": agent["uptime_seconds"],
+            "player_snapshot": agent.get("player_snapshot"),
+            "player_snapshot_ts": agent.get("player_snapshot_ts"),
             "metadata": agent["metadata"]
         }
     
@@ -139,6 +148,30 @@ class AgentHandler:
             data = data.copy()
             data["secret"] = redact_for_log(data["secret"])
         return data
+
+
+def _sanitize_snapshot(snap: dict) -> dict:
+    """Keep only known keys with bounded list sizes from the agent."""
+    out = {"ts": snap.get("ts")}
+    def _cap_list(key, limit=200):
+        v = snap.get(key)
+        return v[:limit] if isinstance(v, list) else []
+    out["online"] = _cap_list("online", 200)
+    out["bans"] = _cap_list("bans", 500)
+    out["ops"] = _cap_list("ops", 100)
+    wl = snap.get("whitelist")
+    if isinstance(wl, dict):
+        entries = wl.get("entries")
+        out["whitelist"] = {
+            "enabled": wl.get("enabled"),
+            "entries": entries[:500] if isinstance(entries, list) else [],
+        }
+    else:
+        out["whitelist"] = {"enabled": None, "entries": []}
+    lp = snap.get("luckperms")
+    out["luckperms"] = lp if isinstance(lp, dict) else {
+        "installed": False, "operational": False}
+    return out
 
 
 agent_handler = AgentHandler()

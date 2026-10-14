@@ -31,6 +31,27 @@ from agent.config import config
 
 ALLOWED_ACTION_TYPES = {
     "start_server", "stop_server", "restart_server", "console_command",
+    # Stage 3 — player management (all executed via the Paper console
+    # channel with validated arguments; results confirmed against
+    # Paper's own JSON state files, never assumed).
+    "kick_player", "ban_player", "unban_player",
+    "whitelist_add", "whitelist_remove", "whitelist_enable", "whitelist_disable",
+    "op_grant", "op_revoke",
+}
+
+# Commands Stage 3 may construct dynamically. Arguments are validated
+# separately (username regex, sanitized reasons) before joining — never
+# shell-interpolated, never eval'd.
+PLAYER_ACTION_COMMANDS = {
+    "kick_player": "kick",
+    "ban_player": "ban",
+    "unban_player": "pardon",
+    "whitelist_add": "whitelist add",
+    "whitelist_remove": "whitelist remove",
+    "whitelist_enable": "whitelist on",
+    "whitelist_disable": "whitelist off",
+    "op_grant": "op",
+    "op_revoke": "deop",
 }
 
 # Minecraft console commands permitted from the dashboard.
@@ -139,6 +160,9 @@ class ActionExecutor:
                 return self._restart()
             if action_type == "console_command":
                 return self._console(params.get("command", ""))
+            # Stage 3 player management
+            if action_type in PLAYER_ACTION_COMMANDS:
+                return self._player_action(action_type, params)
         except Exception as e:
             return {"state": "failed", "error": str(e), "result": {}}
 
@@ -304,6 +328,211 @@ class ActionExecutor:
                     "result": {}}
         return {"state": "success", "error": None,
                 "result": {"command": command, "delivered": True}}
+
+    # --- Stage 3: player management ----------------------------------------
+
+    def _player_action(self, action_type: str, params: dict) -> Dict[str, Any]:
+        """Execute a validated player-management action.
+
+        The command is assembled from a fixed template plus strictly
+        validated arguments (username regex / sanitized reason) — no
+        user string is ever passed to a shell or eval. After each
+        mutation the resulting state is confirmed by re-reading Paper's
+        own JSON files instead of assuming success.
+        """
+        from agent.player_tracker import (
+            player_tracker, valid_username, sanitize_reason,
+        )
+
+        needs_username = action_type not in (
+            "whitelist_enable", "whitelist_disable")
+        username = params.get("username")
+        if needs_username and not valid_username(username):
+            return {"state": "failed",
+                    "error": "Invalid username (3-16 chars: letters, digits, _)",
+                    "result": {}}
+
+        reason = sanitize_reason(params.get("reason"))
+
+        if self.find_paper_pid() is None:
+            return {"state": "failed", "error": "Server is not running",
+                    "result": {}}
+
+        # Build command from template + validated tokens
+        base = PLAYER_ACTION_COMMANDS[action_type]
+        if needs_username:
+            parts = [base, username]
+            if action_type in ("kick_player", "ban_player") and reason:
+                parts.append(reason)
+            command = " ".join(parts)
+        else:
+            command = base
+
+        # Precondition checks against real state (idempotency + safety)
+        pre = self._player_precondition(action_type, username, player_tracker)
+        if pre is not None:
+            return pre
+
+        if not self._write_console(command):
+            return {"state": "failed",
+                    "error": "Console channel unavailable — restart the "
+                             "server from the dashboard to attach the console.",
+                    "result": {}}
+
+        # Allow the server to apply the change before confirming
+        import time as _time
+        _time.sleep(2)
+
+        return self._confirm_player_action(action_type, username, player_tracker)
+
+    def _player_precondition(self, action_type: str, username: str,
+                             tracker) -> Optional[Dict[str, Any]]:
+        """Idempotent checks before sending the command."""
+        if action_type == "kick_player":
+            online_names = [p["username"] for p in tracker.get_online()]
+            if username not in online_names:
+                return {"state": "failed",
+                        "error": f"{username} is not online",
+                        "result": {}}
+        elif action_type == "unban_player":
+            banned = tracker.get_bans()
+            names = {b["username"] for b in banned if b["username"]}
+            uuids = {b["uuid"] for b in banned if b["uuid"]}
+            u = tracker.lookup_uuid(username) if username else None
+            if username not in names and u not in uuids:
+                return {"state": "success", "error": None,
+                        "result": {"already": True,
+                                   "note": "player was not banned"}}
+        elif action_type == "ban_player":
+            banned = tracker.get_bans()
+            names = {b["username"] for b in banned if b["username"]}
+            if username in names:
+                return {"state": "success", "error": None,
+                        "result": {"already": True,
+                                   "note": "player already banned"}}
+        elif action_type == "whitelist_add":
+            entries = {e["username"] for e in
+                       tracker.get_whitelist()["entries"]}
+            if username in entries:
+                return {"state": "success", "error": None,
+                        "result": {"already": True,
+                                   "note": "already whitelisted"}}
+        elif action_type == "whitelist_remove":
+            entries = {e["username"] for e in
+                       tracker.get_whitelist()["entries"]}
+            if username not in entries:
+                return {"state": "success", "error": None,
+                        "result": {"already": True,
+                                   "note": "player was not whitelisted"}}
+        elif action_type == "op_revoke":
+            ops = tracker.get_ops()
+            op_names = {o["username"] for o in ops if o["username"]}
+            # Safeguard: never remove the last operator
+            if username in op_names and len(op_names) <= 1:
+                return {"state": "failed",
+                        "error": "Refusing to revoke the last operator "
+                                 "(would lock out administrative access)",
+                        "result": {}}
+        elif action_type == "op_grant":
+            ops = tracker.get_ops()
+            op_names = {o["username"] for o in ops if o["username"]}
+            if username in op_names:
+                return {"state": "success", "error": None,
+                        "result": {"already": True,
+                                   "note": "player is already an operator"}}
+        return None
+
+    def _confirm_player_action(self, action_type: str, username: str,
+                               tracker) -> Dict[str, Any]:
+        """Confirm the mutation by re-reading Paper's state files."""
+        if action_type == "whitelist_enable" or action_type == "whitelist_disable":
+            want = action_type == "whitelist_enable"
+            got = tracker.get_whitelist()["enabled"]
+            if got is None:
+                return {"state": "success", "error": None,
+                        "result": {"sent": True,
+                                   "confirmed": False,
+                                   "note": "could not read server.properties"}}
+            if got == want:
+                return {"state": "success", "error": None,
+                        "result": {"confirmed": True, "enabled": got}}
+            return {"state": "failed",
+                    "error": "Whitelist toggle did not take effect",
+                    "result": {"enabled": got}}
+
+        if action_type == "whitelist_add":
+            entries = {e["username"] for e in
+                       tracker.get_whitelist()["entries"]}
+            if username in entries:
+                return {"state": "success", "error": None,
+                        "result": {"confirmed": True}}
+            return {"state": "failed",
+                    "error": "Player did not appear in whitelist.json "
+                             "(name may need to have joined the server once)",
+                    "result": {}}
+
+        if action_type == "whitelist_remove":
+            entries = {e["username"] for e in
+                       tracker.get_whitelist()["entries"]}
+            if username not in entries:
+                return {"state": "success", "error": None,
+                        "result": {"confirmed": True}}
+            return {"state": "failed",
+                    "error": "Player still present in whitelist.json",
+                    "result": {}}
+
+        if action_type == "ban_player":
+            names = {b["username"] for b in tracker.get_bans()
+                     if b["username"]}
+            if username in names:
+                return {"state": "success", "error": None,
+                        "result": {"confirmed": True}}
+            return {"state": "failed",
+                    "error": "Ban not found in banned-players.json "
+                             "(player may be unknown to the server)",
+                    "result": {}}
+
+        if action_type == "unban_player":
+            names = {b["username"] for b in tracker.get_bans()
+                     if b["username"]}
+            if username not in names:
+                return {"state": "success", "error": None,
+                        "result": {"confirmed": True}}
+            return {"state": "failed",
+                    "error": "Player still present in banned-players.json",
+                    "result": {}}
+
+        if action_type == "op_grant":
+            names = {o["username"] for o in tracker.get_ops()
+                     if o["username"]}
+            if username in names:
+                return {"state": "success", "error": None,
+                        "result": {"confirmed": True}}
+            return {"state": "failed",
+                    "error": "Player did not appear in ops.json",
+                    "result": {}}
+
+        if action_type == "op_revoke":
+            names = {o["username"] for o in tracker.get_ops()
+                     if o["username"]}
+            if username not in names:
+                return {"state": "success", "error": None,
+                        "result": {"confirmed": True}}
+            return {"state": "failed",
+                    "error": "Player still present in ops.json",
+                    "result": {}}
+
+        if action_type == "kick_player":
+            online = [p["username"] for p in tracker.get_online()]
+            if username not in online:
+                return {"state": "success", "error": None,
+                        "result": {"confirmed": True}}
+            return {"state": "failed",
+                    "error": f"{username} still appears online",
+                    "result": {}}
+
+        return {"state": "failed", "error": "Unhandled player action",
+                "result": {}}
 
     def _wait_termination(self, pid: int, timeout: int) -> bool:
         deadline = time.time() + timeout

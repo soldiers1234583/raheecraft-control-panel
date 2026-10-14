@@ -36,6 +36,7 @@ from agent.config import Config, config
 from agent.status import get_agent_status
 from agent.actions import action_executor
 from agent.logstream import log_streamer, build_log_payload
+from agent.player_tracker import player_tracker
 
 # Configure logging
 logging.basicConfig(
@@ -122,6 +123,11 @@ class ControlAgent:
         import httpx
         
         status = get_agent_status()
+        # Stage 3: real player state from Paper's structured files
+        try:
+            status["player_snapshot"] = player_tracker.snapshot()
+        except Exception as _e:
+            logger.debug(f"player snapshot error: {_e}")
         
         url = f"{config.BACKEND_URL}/api/agent/heartbeat"
         headers = {
@@ -163,7 +169,19 @@ class ControlAgent:
         """Stream new console log lines to the backend (best effort)."""
         import httpx
 
-        payload = build_log_payload(log_streamer)
+        lines = log_streamer.read_new_lines()
+        # Stage 3: feed join/leave/list lines to the player tracker
+        try:
+            player_tracker.observe_lines(lines)
+        except Exception:
+            pass
+
+        from agent.logstream import classify_level
+        import time as _time
+        payload = {
+            "lines": [{"text": l, "level": classify_level(l)} for l in lines],
+            "ts": _time.time(),
+        }
         if not payload["lines"]:
             return True
 
