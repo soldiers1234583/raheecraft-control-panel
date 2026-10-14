@@ -995,8 +995,6 @@ def _max_players():
     return None
 
 
-if __name__ == "__main__":
-    main()
 
 
 # =============================================================================
@@ -1288,3 +1286,7 @@ def operators_revoke(username):
                       "action_id": action["action_id"]}, success=False)
     return {"status": "queued", "action_id": action["action_id"],
             "state": action["state"], "target": username}
+
+
+if __name__ == "__main__":
+    main()
