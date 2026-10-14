@@ -16,6 +16,7 @@ venv/
 *.pem
 credentials.json
 *.secret
+*.env.example
 
 # IDE
 .agents/
@@ -35,3 +36,21 @@ Thumbs.db
 
 # Kaggle output (temporary)
 /kaggle/
+
+# Build outputs
+dist/
+build/
+*.zip
+*.tar.gz
+
+# Editor backups
+*.swp
+*.swo
+*~
+
+# PyCharm
+.idea/
+*.iml
+
+# VS Code
+.vscode/

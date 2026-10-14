@@ -1,0 +1,355 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>RaheeCraft - Dashboard</title>
+    <link rel="stylesheet" href="/static/css/main.css">
+</head>
+<body>
+    <!-- Mobile header -->
+    <header class="mobile-header">
+        <button class="menu-toggle" id="menuToggle" aria-label="Toggle menu">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M3 12h18M3 6h18M3 18h18"/>
+            </svg>
+        </button>
+        <div class="logo">
+            <svg viewBox="0 0 32 32" fill="none" stroke="currentColor" stroke-width="2">
+                <rect x="4" y="4" width="24" height="24" rx="4" fill="currentColor" fill-opacity="0.2"/>
+                <path d="M8 12h16M8 16h12M8 20h8" stroke="currentColor" stroke-linecap="round"/>
+            </svg>
+            <span>RaheeCraft</span>
+        </div>
+        <div class="user-menu">
+            <span class="username" id="username">{{ username or 'User' }}</span>
+            <button class="btn-icon" id="logoutBtn" aria-label="Logout">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <path d="M9 21H5a2 2 0 01-2-2V5a2 2 0 012-2h4M16 17l5-5-5-5M21 12H9"/>
+                </svg>
+            </button>
+        </div>
+    </header>
+    
+    <!-- Sidebar (desktop) -->
+    <aside class="sidebar" id="sidebar">
+        <nav class="nav-main">
+            <a href="#" class="nav-item active" data-section="overview">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <rect x="3" y="3" width="7" height="7" rx="1"/>
+                    <rect x="14" y="3" width="7" height="7" rx="1"/>
+                    <rect x="3" y="14" width="7" height="7" rx="1"/>
+                    <rect x="14" y="14" width="7" height="7" rx="1"/>
+                </svg>
+                <span>Overview</span>
+            </a>
+            <a href="#" class="nav-item" data-section="console">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <polyline points="4 17 10 11 4 5"/>
+                    <line x1="12" y1="19" x2="20" y2="19"/>
+                </svg>
+                <span>Console</span>
+            </a>
+            <a href="#" class="nav-item" data-section="players">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <path d="M17 21v-2a4 4 0 00-4-4H5a4 4 0 00-4 4v2"/>
+                    <circle cx="9" cy="7" r="4"/>
+                    <path d="M23 21v-2a4 4 0 00-3-3.87M16 3.13a4 4 0 010 7.75"/>
+                </svg>
+                <span>Players</span>
+            </a>
+            <a href="#" class="nav-item" data-section="files">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/>
+                    <polyline points="14 2 14 8 20 8"/>
+                    <line x1="16" y1="13" x2="8" y2="13"/>
+                    <line x1="16" y1="17" x2="8" y2="17"/>
+                </svg>
+                <span>Files</span>
+            </a>
+            <a href="#" class="nav-item" data-section="backups">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/>
+                    <polyline points="17 8 12 3 7 8"/>
+                    <line x1="12" y1="3" x2="12" y2="15"/>
+                </svg>
+                <span>Backups</span>
+            </a>
+            <a href="#" class="nav-item" data-section="network">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <path d="M5 12.55a11 11 0 0114.08 0"/>
+                    <path d="M1.42 9a16 16 0 0121.16 0"/>
+                    <path d="M8.53 16.11a6 6 0 016.95 0"/>
+                    <line x1="12" y1="20" x2="12" y2="20"/>
+                </svg>
+                <span>Network</span>
+            </a>
+        </nav>
+        
+        <nav class="nav-secondary">
+            <a href="#" class="nav-item" data-section="settings">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <circle cx="12" cy="12" r="3"/>
+                    <path d="M19.4 15a1.65 1.65 0 00.33 1.82l.06.04a2 2 0 010 2.83 2 2 0 01-2.83 0l-.06-.04a1.65 1.65 0 00-1.82-.33 1.65 1.65 0 00-1 1.51V21a2 2 0 01-2 2 2 2 0 01-2-2v-.09A1.65 1.65 0 009 19.4a1.65 1.65 0 00-1.82.33l-.06.04a2 2 0 01-2.83 0 2 2 0 010-2.83l.06-.04a1.65 1.65 0 00.33-1.82 1.65 1.65 0 00-1.51-1H9a2 2 0 01-2-2 2 2 0 012-2h.09A1.65 1.65 0 0012.6 9a1.65 1.65 0 00.33-1.82l-.06-.04a2 2 0 012.83-2.83l.06.04a1.65 1.65 0 001.82.33H15a1.65 1.65 0 001-1.51V9a2 2 0 012-2 2 2 0 012 2v.09a1.65 1.65 0 001 1.51 1.65 1.65 0 001.82-.33l.06-.04a2 2 0 012.83 2.83l-.06.04a1.65 1.65 0 00-.33 1.82V15a1.65 1.65 0 001.51 1H15a2 2 0 012 2 2 2 0 01-2 2h-.09a1.65 1.65 0 00-1.51 1z"/>
+                </svg>
+                <span>Settings</span>
+            </a>
+            <a href="#" class="nav-item" data-section="monitoring">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <path d="M22 12h-4l-3 9L9 3l-3 9H2"/>
+                </svg>
+                <span>Monitoring</span>
+            </a>
+            <a href="#" class="nav-item" data-section="runtime">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <circle cx="12" cy="12" r="10"/>
+                    <polyline points="12 6 12 12 16 14"/>
+                </svg>
+                <span>Runtime</span>
+            </a>
+        </nav>
+    </aside>
+    
+    <!-- Mobile bottom nav -->
+    <nav class="mobile-nav">
+        <a href="#" class="nav-item mob-nav-overview">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <rect x="3" y="3" width="7" height="7" rx="1"/>
+                <rect x="14" y="3" width="7" height="7" rx="1"/>
+                <rect x="3" y="14" width="7" height="7" rx="1"/>
+                <rect x="14" y="14" width="7" height="7" rx="1"/>
+            </svg>
+            <span>Home</span>
+        </a>
+        <a href="#" class="nav-item mob-nav-console">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <polyline points="4 17 10 11 4 5"/>
+                <line x1="12" y1="19" x2="20" y2="19"/>
+            </svg>
+            <span>Console</span>
+        </a>
+        <a href="#" class="nav-item mob-nav-players">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M17 21v-2a4 4 0 00-4-4H5a4 4 0 00-4 4v2"/>
+                <circle cx="9" cy="7" r="4"/>
+            </svg>
+            <span>Players</span>
+        </a>
+        <a href="#" class="nav-item mob-nav-backups">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/>
+                <polyline points="17 8 12 3 7 8"/>
+            </svg>
+            <span>Backups</span>
+        </a>
+        <a href="#" class="nav-item mob-nav-settings">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <circle cx="12" cy="12" r="3"/>
+                <path d="M19.4 15a1.65 1.65 0 00.33 1.82l.06.04a2 2 0 010 2.83 2 2 0 01-2.83 0l-.06-.04a1.65 1.65 0 00-1.82-.33 1.65 1.65 0 00-1 1.51V21a2 2 0 01-2 2 2 2 0 01-2-2v-.09A1.65 1.65 0 009 19.4a1.65 1.65 0 00-1.82.33l-.06.04a2 2 0 01-2.83 2.83l-.06.04a1.65 1.65 0 00.33-1.82 1.65 1.65 0 00-1.51-1H9a2 2 0 01-2-2 2 2 0 012-2h.09A1.65 1.65 0 0012.6 9a1.65 1.65 0 00.33-1.82l-.06-.04a2 2 0 012.83 2.83l-.06.04a1.65 1.65 0 00-.33 1.82V15a1.65 1.65 0 001.51 1H15a2 2 0 012 2 2 2 0 01-2 2h-.09a1.65 1.65 0 00-1.51 1z"/>
+            </svg>
+            <span>Settings</span>
+        </a>
+    </nav>
+    
+    <!-- Main content -->
+    <main class="main-content">
+        <!-- Loading state -->
+        <div id="loading-state" class="state-panel loading">
+            <div class="spinner-large"></div>
+            <p>Loading dashboard...</p>
+        </div>
+        
+        <!-- Offline state -->
+        <div id="offline-state" class="state-panel" style="display: none;">
+            <div class="state-icon offline">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <line x1="1" y1="1" x2="23" y2="23"/>
+                    <path d="M16 16a4 4 0 00-8 0c0 3-2 5-2 7 0 4 4 6 8 6s8-2 8-6c0-2-2-4-2-7z"/>
+                    <line x1="18" y1="18" x2="22" y2="22"/>
+                </svg>
+            </div>
+            <h2>Server Offline</h2>
+            <p>The control agent is not connected. The Kaggle runtime may be stopped.</p>
+            <div class="offline-actions">
+                <a href="https://www.kaggle.com/code" target="_blank" class="btn btn-primary">
+                    Open Kaggle Notebook
+                </a>
+            </div>
+        </div>
+        
+        <!-- Error state -->
+        <div id="error-state" class="state-panel" style="display: none;">
+            <div class="state-icon error">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <circle cx="12" cy="12" r="10"/>
+                    <line x1="12" y1="8" x2="12" y2="12"/>
+                    <line x1="12" y1="16" x2="12.01" y2="16"/>
+                </svg>
+            </div>
+            <h2 id="error-title">Error</h2>
+            <p id="error-message"></p>
+        </div>
+        
+        <!-- Dashboard content -->
+        <div id="dashboard-content" style="display: none;">
+            
+            <!-- Server Status Card -->
+            <section class="card server-status-card">
+                <div class="card-header">
+                    <h2>Server Status</h2>
+                    <div class="status-badge" id="server-status-badge">
+                        <span class="status-dot"></span>
+                        <span class="status-text">Loading...</span>
+                    </div>
+                </div>
+                <div class="card-body">
+                    <div class="status-grid">
+                        <div class="status-item">
+                            <span class="status-label">Server</span>
+                            <span class="status-value" id="server-status">-</span>
+                        </div>
+                        <div class="status-item">
+                            <span class="status-label">Version</span>
+                            <span class="status-value" id="server-version">-</span>
+                        </div>
+                        <div class="status-item">
+                            <span class="status-label">Players</span>
+                            <span class="status-value" id="server-players">-</span>
+                        </div>
+                        <div class="status-item">
+                            <span class="status-label">World</span>
+                            <span class="status-value" id="server-world">-</span>
+                        </div>
+                    </div>
+                </div>
+                <div class="card-footer">
+                    <div class="action-buttons">
+                        <button class="btn btn-secondary" id="btn-start" disabled>
+                            <svg viewBox="0 0 24 24" fill="currentColor"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+                            Start
+                        </button>
+                        <button class="btn btn-danger" id="btn-stop" disabled>
+                            <svg viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="6" width="12" height="12"/></svg>
+                            Stop
+                        </button>
+                        <button class="btn btn-secondary" id="btn-restart" disabled>
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 11-2.12-9.36L23 10"/></svg>
+                            Restart
+                        </button>
+                    </div>
+                </div>
+            </section>
+            
+            <!-- Agent Card -->
+            <section class="card agent-card">
+                <div class="card-header">
+                    <h2>Control Agent</h2>
+                    <span class="connection-status" id="agent-status">
+                        <span class="status-dot"></span>
+                        Disconnected
+                    </span>
+                </div>
+                <div class="card-body">
+                    <div class="agent-details">
+                        <div class="detail-row">
+                            <span class="detail-label">Last Heartbeat</span>
+                            <span class="detail-value" id="agent-heartbeat">-</span>
+                        </div>
+                        <div class="detail-row">
+                            <span class="detail-label">Agent ID</span>
+                            <span class="detail-value mono" id="agent-id">-</span>
+                        </div>
+                        <div class="detail-row">
+                            <span class="detail-label">Uptime</span>
+                            <span class="detail-value" id="agent-uptime">-</span>
+                        </div>
+                    </div>
+                </div>
+            </section>
+            
+            <!-- Playit Card -->
+            <section class="card playit-card">
+                <div class="card-header">
+                    <h2>Playit.gg Tunnel</h2>
+                    <span class="connection-status" id="playit-status">
+                        <span class="status-dot"></span>
+                        Checking...
+                    </span>
+                </div>
+                <div class="card-body">
+                    <div class="playit-details">
+                        <div class="detail-row">
+                            <span class="detail-label">Java Address</span>
+                            <div class="address-box">
+                                <code id="playit-java-address">-</code>
+                                <button class="btn-icon copy-btn" data-copy="playit-java" aria-label="Copy Java address">
+                                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                        <rect x="9" y="9" width="13" height="13" rx="2" ry="2"/>
+                                        <path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/>
+                                    </svg>
+                                </button>
+                            </div>
+                        </div>
+                        <div class="detail-row">
+                            <span class="detail-label">Bedrock</span>
+                            <span class="detail-value" id="playit-bedrock">Limited on free tier</span>
+                        </div>
+                    </div>
+                </div>
+            </section>
+            
+            <!-- Backup Card -->
+            <section class="card backup-card">
+                <div class="card-header">
+                    <h2>Google Drive Backup</h2>
+                    <span class="connection-status" id="backup-status">
+                        <span class="status-dot"></span>
+                        Checking...
+                    </span>
+                </div>
+                <div class="card-body">
+                    <div class="backup-details">
+                        <div class="detail-row">
+                            <span class="detail-label">Last Backup</span>
+                            <span class="detail-value" id="backup-last">-</span>
+                        </div>
+                        <div class="detail-row">
+                            <span class="detail-label">Size</span>
+                            <span class="detail-value" id="backup-size">-</span>
+                        </div>
+                        <div class="detail-row">
+                            <span class="detail-label">Enabled</span>
+                            <span class="detail-value" id="backup-enabled">-</span>
+                        </div>
+                    </div>
+                    <div class="backup-actions">
+                        <button class="btn btn-secondary" id="btn-backup-now">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/>
+                                <polyline points="17 8 12 3 7 8"/>
+                                <line x1="12" y1="3" x2="12" y2="15"/>
+                            </svg>
+                            Create Backup
+                        </button>
+                    </div>
+                </div>
+            </section>
+            
+            <!-- Recent Events -->
+            <section class="card events-card">
+                <div class="card-header">
+                    <h2>Recent Events</h2>
+                </div>
+                <div class="card-body">
+                    <div class="events-list" id="events-list">
+                        <p class="empty-state">No recent events</p>
+                    </div>
+                </div>
+            </section>
+            
+        </div>
+    </main>
+    
+    <script src="/static/js/dashboard.js"></script>
+</body>
+</html>
