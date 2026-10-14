@@ -1,0 +1,81 @@
+# RaheeCraft Agent - Environment Configuration for Kaggle Notebook
+# ============================================================
+# Copy these settings to your Kaggle notebook cell
+# NEVER hardcode credentials in notebook source!
+
+# ============================================================
+# REQUIRED: Backend URL
+# ============================================================
+# Set this to your deployed Render URL (from Render dashboard)
+# Example: https://raheecraft-control-panel.onrender.com
+os.environ['BACKEND_URL'] = 'https://YOUR-RENDER-APP-NAME.onrender.com'
+
+# ============================================================
+# REQUIRED: Agent credentials (from backend registration)
+# ============================================================
+# After deploying backend and visiting /register-agent:
+# 1. Go to your backend URL + /register-agent
+# 2. Copy the AGENT_ID and AGENT_SECRET shown
+# 3. Paste them below
+os.environ['AGENT_ID'] = 'agent-your-agent-id-here'
+os.environ['AGENT_SECRET'] = 'your-agent-secret-here'
+
+# ============================================================
+# KAGGLE SERVER SETTINGS
+# ============================================================
+
+# Path to Minecraft server on Kaggle
+os.environ['SERVER_DIR'] = '/kaggle/working/minecraft_server'
+
+# ============================================================
+# OPTIONAL: Google Drive (for backup integration)
+# ============================================================
+
+# Only needed if you want the agent to report backup status
+# os.environ['GOOGLE_CLIENT_ID'] = '...'
+# os.environ['GOOGLE_CLIENT_SECRET'] = '...'
+# os.environ['GDRIVE_CLIENT_ID'] = '...'
+# os.environ['GDRIVE_CLIENT_SECRET'] = '...'
+
+# ============================================================
+# OPTIONAL: Playit (for tunnel status)
+# ============================================================
+
+# Only needed if you want the agent to report Playit status
+# os.environ['PLAYIT_TOKEN'] = 'your-playit-token'
+
+# ============================================================
+# AGENT BEHAVIOR
+# ============================================================
+
+# Polling interval in seconds (default: 30)
+# Higher = less load on backend, lower = more real-time updates
+os.environ['POLL_INTERVAL_SECONDS'] = '30'
+
+# Connection timeout in seconds (default: 10)
+os.environ['CONNECT_TIMEOUT'] = '10'
+
+# Maximum retries before giving up (default: 3)
+os.environ['MAX_RETRIES'] = '3'
+
+# Base delay for exponential backoff in seconds (default: 1)
+os.environ['RETRY_BASE_DELAY'] = '1'
+
+# ============================================================
+# HOW TO USE IN KAGGLE NOTEBOOK
+# ============================================================
+
+# Cell 1: Set environment variables (edit BACKEND_URL and credentials)
+# <copy the environment settings above>
+
+# Cell 2: Run the agent
+# import sys
+# sys.path.insert(0, '/kaggle/working/raheecraft/agent')
+# from agent.main import run_agent
+# run_agent()
+
+# The agent will:
+# 1. Connect to your backend
+# 2. Register itself
+# 3. Send periodic heartbeats with server status
+# 4. Reconnect automatically if connection fails
