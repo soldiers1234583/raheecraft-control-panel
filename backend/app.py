@@ -18,7 +18,13 @@ import logging
 from pathlib import Path
 
 from bottle import Bottle, request, response, template, redirect, abort
-from bottle import SimpleTemplate
+from bottle import SimpleTemplate, TEMPLATE_PATH
+
+# Ensure templates resolve regardless of the working directory (Render runs
+# from backend/, local runs often from the project root).
+_BACKEND_DIR = Path(__file__).parent
+if str(_BACKEND_DIR / "templates") not in TEMPLATE_PATH:
+    TEMPLATE_PATH.insert(0, str(_BACKEND_DIR / "templates"))
 
 # Add project root to path
 PROJECT_ROOT = Path(__file__).parent.parent
@@ -60,6 +66,29 @@ def after_request():
     response.headers['X-Frame-Options'] = 'DENY'
     response.headers['X-XSS-Protection'] = '1; mode=block'
     response.headers['Cache-Control'] = 'no-store'
+
+
+def json_error_handler(res):
+    """Return abort() payloads as JSON instead of bottle's HTML error page.
+
+    Views call abort(code, {"error": ...}) — the dashboard parses that body.
+    """
+    response.content_type = 'application/json'
+    body = res.body
+    if isinstance(body, (dict, list)):
+        return json.dumps(body)
+    if isinstance(body, bytes):
+        body = body.decode(errors='replace')
+    try:
+        parsed = json.loads(str(body))
+        if isinstance(parsed, (dict, list)):
+            return json.dumps(parsed)
+    except (ValueError, TypeError):
+        pass
+    return json.dumps({"error": str(body), "code": res.status_code})
+
+
+app.default_error_handler = json_error_handler
 
 
 # =============================================================================
@@ -524,6 +553,417 @@ def main():
         debug=config.DEBUG,
         reloader=False  # Disable reloader for production
     )
+
+# =============================================================================
+# Power Control Endpoints (Stage 2)
+# =============================================================================
+
+from backend.command_handler import command_handler, ActionResult, ActionState
+
+
+@app.route('/api/admin/server/start', method='POST')
+@require_admin
+@rate_limit(max_requests=5, window=60)
+def start_server():
+    """Queue a start action for the Kaggle agent.
+
+    Returns state=pending with an action_id — the request being queued is
+    NOT reported as a successful start.
+    """
+    existing = [a for a in command_handler.list_actions(10)
+                if a["action_type"] in ("start_server", "restart_server")
+                and a["state"] in ("pending", "running")]
+
+    if existing:
+        return {
+            "status": "busy",
+            "message": "Server operation already in progress",
+            "action_id": existing[0]["action_id"],
+            "state": existing[0]["state"]
+        }
+
+    agent = _require_online_agent()
+    try:
+        action = command_handler.queue_for_agent(
+            "start_server", {}, agent_id=agent["agent_id"])
+    except RuntimeError as e:
+        abort(429, {"error": str(e)})
+
+    config.log_audit("server_start", request.user_id,
+                     {"action_id": action["action_id"], "state": action["state"]},
+                     success=False)
+    return {"status": "queued", "message": "Start queued for agent — poll for result",
+            **action}
+
+
+@app.route('/api/admin/server/stop', method='POST')
+@require_admin
+@rate_limit(max_requests=5, window=60)
+def stop_server():
+    """Queue a graceful stop (Minecraft `stop` → world saves) for the agent."""
+    existing = [a for a in command_handler.list_actions(10)
+                if a["action_type"] in ("stop_server", "restart_server")
+                and a["state"] in ("pending", "running")]
+
+    if existing:
+        return {
+            "status": "busy",
+            "message": "Server operation already in progress",
+            "action_id": existing[0]["action_id"],
+            "state": existing[0]["state"]
+        }
+
+    agent = _require_online_agent()
+    try:
+        action = command_handler.queue_for_agent(
+            "stop_server", {}, agent_id=agent["agent_id"])
+    except RuntimeError as e:
+        abort(429, {"error": str(e)})
+
+    config.log_audit("server_stop", request.user_id,
+                     {"action_id": action["action_id"], "state": action["state"]},
+                     success=False)
+    return {"status": "queued", "message": "Stop queued for agent — poll for result",
+            **action}
+
+
+@app.route('/api/admin/server/restart', method='POST')
+@require_admin
+@rate_limit(max_requests=3, window=120)
+def restart_server():
+    """Queue a controlled restart: agent stops, verifies termination, starts."""
+    existing = [a for a in command_handler.list_actions(10)
+                if a["state"] in ("pending", "running")]
+
+    if existing:
+        return {
+            "status": "busy",
+            "message": "Server operation already in progress",
+            "action_id": existing[0]["action_id"],
+            "state": existing[0]["state"]
+        }
+
+    agent = _require_online_agent()
+    try:
+        action = command_handler.queue_for_agent(
+            "restart_server", {}, agent_id=agent["agent_id"])
+    except RuntimeError as e:
+        abort(429, {"error": str(e)})
+
+    config.log_audit("server_restart", request.user_id,
+                     {"action_id": action["action_id"], "state": action["state"]},
+                     success=False)
+    return {"status": "queued", "message": "Restart queued for agent — poll for result",
+            **action}
+
+
+@app.route('/api/admin/server/actions', method='GET')
+@require_admin
+def list_server_actions():
+    """List recent server actions."""
+    limit = request.query.limit or 50
+    try:
+        limit = int(limit)
+    except (ValueError, TypeError):
+        limit = 50
+    
+    return {"actions": command_handler.list_actions(limit)}
+
+
+@app.route('/api/admin/server/actions/<action_id>', method='GET')
+@require_admin
+def get_server_action(action_id):
+    """Get a specific action."""
+    action = command_handler.get_action(action_id)
+    if not action:
+        abort(404, {"error": "Action not found"})
+    return action
+
+
+@app.route('/api/admin/server/actions/<action_id>', method='DELETE')
+@require_admin
+def cancel_server_action(action_id):
+    """Cancel a pending action."""
+    if command_handler.cancel_action(action_id):
+        config.log_audit("action_cancel", request.user_id,
+                         {"action_id": action_id}, success=True)
+        return {"status": "cancelled"}
+    abort(404, {"error": "Action not found or cannot be cancelled"})
+
+
+@app.route('/api/admin/server/console', method='POST')
+@require_admin
+@rate_limit(max_requests=30, window=60)
+def send_console_command():
+    """Send a console command to the server."""
+    data = request.json or {}
+    command = data.get("command", "").strip()
+    
+    if not command:
+        abort(400, {"error": "Command required"})
+    
+    if len(command) > 500:
+        abort(400, {"error": "Command too long (max 500 chars)"})
+
+    # Strict allowlist validation happens backend-side (defense in depth);
+    # the agent re-validates before writing to the Paper console channel.
+    base_cmd = command.split()[0].lower() if command.split() else ""
+    if base_cmd not in command_handler.ALLOWED_COMMANDS:
+        abort(400, {"error": f"Command '{base_cmd}' not allowed"})
+
+    agent = _require_online_agent()
+    try:
+        action = command_handler.queue_for_agent(
+            "console_command", {"command": command},
+            agent_id=agent["agent_id"])
+    except RuntimeError as e:
+        abort(429, {"error": str(e)})
+
+    config.log_audit("console_command", request.user_id,
+                     {"action_id": action["action_id"], "command": command[:50]},
+                     success=False)
+    return {"status": "queued", "message": "Command queued for agent",
+            **action}
+
+
+@app.route('/api/admin/console/logs', method='GET')
+@require_user
+def get_recent_logs():
+    """Get recent log lines with optional filtering."""
+    log_path = server_status.get_log_path()
+    
+    if not log_path.exists():
+        return {"lines": [], "total": 0}
+    
+    try:
+        lines = log_path.read_text().splitlines()
+        
+        filter_type = request.query.filter or ""
+        search = request.query.search or ""
+        
+        filtered = lines
+        
+        if filter_type:
+            filtered = [l for l in filtered if filter_type.lower() in l.lower()]
+        
+        if search:
+            filtered = [l for l in filtered if search.lower() in l.lower()]
+        
+        max_lines = min(int(request.query.limit or 200), 500)
+        recent = filtered[-max_lines:]
+        
+        return {
+            "lines": recent,
+            "total": len(lines),
+            "filtered": len(filtered),
+            "filter": filter_type,
+            "search": search
+        }
+    except Exception as e:
+        logger.error(f"Error reading logs: {e}")
+        return {"lines": [], "total": 0, "error": str(e)}
+
+
+# =============================================================================
+# Stage 2 — Agent Action Relay & Log Streaming
+# =============================================================================
+# Paper runs on Kaggle. The browser queues an action here; the agent polls
+# it via POST /api/agent/poll (outbound HTTPS only), executes locally, and
+# reports back via POST /api/agent/actions/<id>/result. Log lines stream
+# with each heartbeat and land in the in-memory log buffer.
+
+from backend.log_buffer import log_buffer
+
+
+def _require_online_agent():
+    """Abort 503 if no registered agent is currently heartbeating."""
+    online = [a for a in agent_handler.get_all_agents_status()
+              if agent_handler.is_agent_online(a["agent_id"])]
+    if not online:
+        abort(503, {"error": "No agent online — start the Kaggle notebook agent",
+                    "state": "agent_offline"})
+    return online[0]
+
+
+@app.route('/api/agent/poll', method='POST')
+@require_agent
+@rate_limit(max_requests=60, window=60)
+def agent_poll():
+    """Agent pulls pending power/console actions (with timeout sweep)."""
+    command_handler.sweep_timeouts()
+    actions = command_handler.pop_for_agent(request.agent_id, limit=3)
+    return {"actions": actions, "server_time": time.time()}
+
+
+@app.route('/api/agent/actions/<action_id>', method='POST')
+@require_agent
+@rate_limit(max_requests=60, window=60)
+def agent_action_result(action_id):
+    """Agent reports the terminal state of an action (idempotent)."""
+    data = request.json or {}
+    state = data.get("state")
+    if state not in ("success", "failed", "timeout", "cancelled"):
+        abort(400, {"error": "state must be success|failed|timeout|cancelled"})
+
+    # Only the agent the action was addressed to may complete it
+    action = command_handler.get_action(action_id)
+    if not action:
+        abort(404, {"error": "Action not found"})
+    if action.get("agent_id") and action["agent_id"] != request.agent_id:
+        abort(403, {"error": "Action belongs to another agent"})
+
+    try:
+        result = command_handler.complete_from_agent(
+            action_id, state,
+            error=data.get("error"),
+            result=data.get("result")
+        )
+    except (ValueError, KeyError) as e:
+        abort(400, {"error": str(e)})
+
+    config.log_audit("agent_action_result", request.agent_id,
+                     {"action_id": action_id, "state": state},
+                     success=(state == "success"))
+    return result
+
+
+@app.route('/api/agent/logs', method='POST')
+@require_agent
+@rate_limit(max_requests=60, window=60)
+def agent_log_push():
+    """Agent streams new console log lines (redacted before storage)."""
+    data = request.json or {}
+    lines = data.get("lines", [])
+    if not isinstance(lines, list):
+        abort(400, {"error": "lines must be a list"})
+    if len(lines) > 500:
+        abort(400, {"error": "Too many lines (max 500 per push)"})
+
+    accepted = log_buffer.extend(lines, source="agent")
+    return {"accepted": accepted}
+
+
+@app.route('/api/admin/console/tail', method='GET')
+@require_user
+def console_tail():
+    """Tail the streamed console log with reconnect-safe sequence numbers.
+
+    Client passes ?since=<last_seq> to fetch only new lines.
+    """
+    try:
+        since = int(request.query.since or 0)
+    except (ValueError, TypeError):
+        since = 0
+    limit = min(int(request.query.limit or 200), 500) \
+        if str(request.query.limit or "").isdigit() else 200
+
+    return log_buffer.tail(
+        since=since,
+        limit=limit,
+        level=request.query.level or None,
+        search=request.query.search or None
+    )
+
+
+@app.route('/api/admin/monitoring', method='GET')
+@require_user
+def get_monitoring():
+    """Real measurements for dashboard monitoring cards.
+
+    Values that cannot be measured are returned as null with a reason
+    rather than invented.
+    """
+    command_handler.sweep_timeouts()
+
+    agents = agent_handler.get_all_agents_status()
+    online_agents = [a for a in agents
+                     if agent_handler.is_agent_online(a["agent_id"])]
+    agent_status = online_agents[0] if online_agents else (
+        agents[0] if agents else None)
+    # Never let a missing agent crash the endpoint — measurements degrade
+    # to null with a note instead.
+    agent = agent_status or {}
+
+    # Server process state comes from the agent heartbeat (Kaggle side)
+    paper_running = bool(agent and agent.get("paper_status") == "running")
+    last_hb = agent.get("last_heartbeat")
+    hb_age = (time.time() - last_hb) if last_hb else None
+
+    # Paper memory/CPU: agent reports system-wide metrics; per-process
+    # Java memory is not measurable remotely → null with reason.
+    mem_note = None
+    java_memory_mb = None
+    if agent and agent.get("memory_percent") is not None:
+        mem_note = "system memory used (host-wide, not per-JVM)"
+
+    # Log activity
+    tail = log_buffer.tail(since=0, limit=1)
+    last_log = tail["lines"][-1] if tail["lines"] else None
+
+    # In-flight actions
+    inflight = [a for a in command_handler.list_actions(20)
+                if a["state"] in ("pending", "running")]
+
+    return {
+        "process": {
+            "state": "online" if paper_running else "offline",
+            "pid": agent.get("paper_pid") if agent else None,
+            "measured": bool(agent_status),
+            "note": None if agent_status else "no agent heartbeat data",
+        },
+        "uptime_seconds": (agent.get("uptime_seconds") if agent else None)
+                          if paper_running else 0,
+        "players": {
+            "online": agent.get("player_count") if agent and paper_running else None,
+            "max": _max_players(),
+            "note": None if paper_running else "server not running",
+        },
+        "memory": {
+            "system_percent": agent.get("cpu_percent") and agent.get("memory_percent"),
+            "memory_percent": agent.get("memory_percent") if agent else None,
+            "java_rss_mb": java_memory_mb,
+            "note": mem_note or ("no agent data" if not agent_status else None),
+        },
+        "cpu": {
+            "percent": agent.get("cpu_percent") if agent else None,
+            "note": None if agent_status else "no agent data",
+        },
+        "agent": {
+            "online": bool(online_agents),
+            "last_heartbeat": last_hb,
+            "heartbeat_age_seconds": round(hb_age, 1) if hb_age is not None else None,
+            "agent_id": agent_status["agent_id"] if agent_status else None,
+        },
+        "log_activity": {
+            "last_line": last_log["text"] if last_log else None,
+            "last_line_ts": last_log["ts"] if last_log else None,
+            "last_agent_push": log_buffer.last_agent_push,
+            "buffered": len(log_buffer.tail(since=0, limit=500)["lines"]),
+        },
+        "playit": (agent.get("playit_status") == "running",
+                   agent.get("playit_address")),
+        "playit_detail": {
+            "running": bool(agent.get("playit_status") == "running"),
+            "address": agent.get("playit_address") if agent else None,
+        },
+        "backup": {
+            "last": agent.get("drive_last_backup"),
+            "source": "agent-reported",
+        },
+        "inflight_actions": inflight,
+        "timestamp": time.time(),
+    }
+
+
+def _max_players():
+    """Read max Players from server.properties if present (local dev only)."""
+    try:
+        props = server_status.server_properties()
+        if props and "max-players" in props:
+            return int(props["max-players"])
+    except Exception:
+        pass
+    return None
 
 
 if __name__ == "__main__":

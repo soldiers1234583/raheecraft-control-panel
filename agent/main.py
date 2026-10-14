@@ -34,6 +34,8 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from agent.config import Config, config
 from agent.status import get_agent_status
+from agent.actions import action_executor
+from agent.logstream import log_streamer, build_log_payload
 
 # Configure logging
 logging.basicConfig(
@@ -149,13 +151,89 @@ class ControlAgent:
             logger.error(f"Heartbeat error: {e}")
             return False
     
+    def _headers(self) -> dict:
+        """Authenticated agent request headers."""
+        return {
+            "X-Agent-ID": config.AGENT_ID,
+            "X-Agent-Token": config.AGENT_SECRET,
+            "Content-Type": "application/json",
+        }
+
+    def push_logs(self) -> bool:
+        """Stream new console log lines to the backend (best effort)."""
+        import httpx
+
+        payload = build_log_payload(log_streamer)
+        if not payload["lines"]:
+            return True
+
+        try:
+            response = httpx.post(
+                f"{config.BACKEND_URL}/api/agent/logs",
+                headers=self._headers(),
+                json=payload,
+                timeout=config.CONNECT_TIMEOUT,
+            )
+            return response.status_code == 200
+        except Exception:
+            return False
+
+    def poll_and_execute_actions(self) -> int:
+        """Fetch pending actions from backend, execute, report results.
+
+        Only allowlisted action types are executed (executor re-validates).
+        Returns number of actions processed.
+        """
+        import httpx
+
+        try:
+            response = httpx.post(
+                f"{config.BACKEND_URL}/api/agent/poll",
+                headers=self._headers(),
+                json={},
+                timeout=config.CONNECT_TIMEOUT,
+            )
+            if response.status_code != 200:
+                return 0
+            actions = response.json().get("actions", [])
+        except Exception:
+            return 0
+
+        processed = 0
+        for action in actions:
+            action_id = action.get("action_id")
+            logger.info(
+                f"Executing action {action_id}: {action.get('action_type')}"
+            )
+            result = action_executor.execute(action)
+
+            # Report terminal state (idempotent on the backend)
+            try:
+                httpx.post(
+                    f"{config.BACKEND_URL}/api/agent/actions/{action_id}",
+                    headers=self._headers(),
+                    json={
+                        "state": result["state"],
+                        "error": result.get("error"),
+                        "result": result.get("result") or {},
+                    },
+                    timeout=config.CONNECT_TIMEOUT,
+                )
+            except Exception as e:
+                logger.warning(f"Could not report action result: {e}")
+            processed += 1
+
+        return processed
+
     def run(self):
         """
         Main agent loop.
-        
+
         1. Register with backend
         2. Send periodic heartbeats
-        3. Reconnect on failure with backoff
+        3. Poll & execute queued power/console actions
+        4. Stream new console log lines
+        5. Reconnect on failure with backoff
         """
         logger.info("=" * 50)
         logger.info("RaheeCraft Control Agent starting")
@@ -179,13 +257,25 @@ class ControlAgent:
             # Reset retry delay on successful registration
             retry_delay = config.RETRY_BASE_DELAY
             
-            # Send heartbeats
+            # Send heartbeats, run actions, stream logs
             while self.running:
                 success = self.send_heartbeat()
-                
+
                 if not success:
                     logger.warning("Heartbeat failed, will retry on next cycle")
-                
+                else:
+                    # Pull queued actions (start/stop/restart/console)
+                    try:
+                        self.poll_and_execute_actions()
+                    except Exception as e:
+                        logger.error(f"Action polling error: {e}")
+
+                    # Stream new console lines (offset-based, no replay)
+                    try:
+                        self.push_logs()
+                    except Exception as e:
+                        logger.debug(f"Log push error: {e}")
+
                 time.sleep(config.POLL_INTERVAL_SECONDS)
         
         logger.info("Agent stopped")

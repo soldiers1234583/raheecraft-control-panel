@@ -17,9 +17,16 @@ class Config:
     HOST: str = os.environ.get("HOST", "0.0.0.0")
     PORT: int = int(os.environ.get("PORT", "8080"))
     DEBUG: bool = os.environ.get("DEBUG", "false").lower() == "true"
+
+    # Minecraft server directory (Kaggle path unless overridden)
+    SERVER_DIR: str = os.environ.get("SERVER_DIR", "/kaggle/working/minecraft_server")
     
     # Secret key for sessions (auto-generated if not set)
     SECRET_KEY: str = os.environ.get("SECRET_KEY", secrets.token_hex(32))
+
+    # Admin password: bcrypt-free salted hash (set by main() from
+    # ADMIN_PASSWORD, or provided directly via ADMIN_PASSWORD_HASH env).
+    ADMIN_PASSWORD_HASH: str = os.environ.get("ADMIN_PASSWORD_HASH", "")
     
     # Agent authentication
     AGENT_TOKEN_HEADER: str = "X-Agent-Token"

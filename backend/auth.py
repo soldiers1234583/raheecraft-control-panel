@@ -7,6 +7,7 @@ Uses HMAC-based verification (no external crypto dependencies).
 
 import hashlib
 import hmac
+import re
 import time
 import secrets
 import os
@@ -82,6 +83,32 @@ def redact_for_log(value: str, show_chars: int = 4) -> str:
     if len(value) <= show_chars * 2:
         return "***"
     return value[:show_chars] + "***" + value[-show_chars:]
+
+
+# Patterns that look like secrets in free-form text (log lines, errors)
+_SECRET_PATTERNS = [
+    (re.compile(r'(?i)\b(password|passwd|secret|token|api[_-]?key|authorization)\b(\s*[=:]\s*)(\S+)'),
+     r'\1\2***'),
+    (re.compile(r'(?i)\b(kaggle[_-]?key|kaggle[_-]?token)\b(\s*[=:]\s*)(\S+)'),
+     r'\1\2***'),
+    (re.compile(r'KGAT_[A-Za-z0-9]+'), 'KGAT_***'),
+    (re.compile(r'\b[0-9a-f]{32,}\b'), '***'),
+    (re.compile(r'(?i)(Bearer\s+)([A-Za-z0-9._\-]+)'), r'\1***'),
+]
+
+
+def redact_text(text: str) -> str:
+    """Redact secret-looking patterns in free-form text (log lines).
+
+    Unlike redact_for_log (which truncates a single known secret value),
+    this scrubs patterns such as `password=...`, `KGAT_...`, long hex
+    strings, and bearer tokens from arbitrary lines.
+    """
+    if not text:
+        return text
+    for pattern, replacement in _SECRET_PATTERNS:
+        text = pattern.sub(replacement, text)
+    return text
 
 
 def get_admin_password_hash() -> Optional[str]:

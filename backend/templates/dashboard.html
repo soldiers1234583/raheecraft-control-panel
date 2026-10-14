@@ -193,13 +193,24 @@
         <!-- Dashboard content -->
         <div id="dashboard-content" style="display: none;">
             
-            <!-- Server Status Card -->
+            <!-- Server Power Card -->
             <section class="card server-status-card">
                 <div class="card-header">
-                    <h2>Server Status</h2>
+                    <h2>Server Power</h2>
                     <div class="status-badge" id="server-status-badge">
                         <span class="status-dot"></span>
                         <span class="status-text">Loading...</span>
+                    </div>
+                </div>
+                <div class="card-body">
+                    <div class="power-state-row">
+                        <span class="power-state" id="power-state" data-state="unknown">-</span>
+                        <span class="power-state-note" id="power-state-note"></span>
+                    </div>
+                    <div class="pending-action" id="pending-action" style="display: none;">
+                        <div class="spinner-small"></div>
+                        <span id="pending-action-text">Working...</span>
+                        <span class="mono muted" id="pending-action-id"></span>
                     </div>
                 </div>
                 <div class="card-body">
@@ -222,21 +233,50 @@
                         </div>
                     </div>
                 </div>
-                <div class="card-footer">
-                    <div class="action-buttons">
-                        <button class="btn btn-secondary" id="btn-start" disabled>
-                            <svg viewBox="0 0 24 24" fill="currentColor"><polygon points="5 3 19 12 5 21 5 3"/></svg>
-                            Start
-                        </button>
-                        <button class="btn btn-danger" id="btn-stop" disabled>
-                            <svg viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="6" width="12" height="12"/></svg>
-                            Stop
-                        </button>
-                        <button class="btn btn-secondary" id="btn-restart" disabled>
-                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 11-2.12-9.36L23 10"/></svg>
-                            Restart
-                        </button>
-                    </div>
+                <div class="card-footer">                        <div class="action-buttons">
+                            <button class="btn btn-secondary" id="btn-start" disabled>
+                                <svg viewBox="0 0 24 24" fill="currentColor"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+                                Start
+                            </button>
+                            <button class="btn btn-danger" id="btn-stop" disabled>
+                                <svg viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="6" width="12" height="12"/></svg>
+                                Stop
+                            </button>
+                            <button class="btn btn-secondary" id="btn-restart" disabled>
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 11-2.12-9.36L23 10"/></svg>
+                                Restart
+                            </button>
+                            <button class="btn btn-secondary" id="btn-refresh" title="Refresh status">
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 4 23 10 17 10"/><path d="M1 20h4a8 8 0 0014.9-4M23 20h-4a8 8 0 00-1.9-5.6"/></svg>
+                                Refresh
+                            </button>
+                        </div>
+                        <div class="status-grid">
+                            <div class="status-item">
+                                <span class="status-label">Uptime</span>
+                                <span class="status-value" id="mon-uptime">-</span>
+                            </div>
+                            <div class="status-item">
+                                <span class="status-label">Players</span>
+                                <span class="status-value" id="mon-players">-</span>
+                            </div>
+                            <div class="status-item">
+                                <span class="status-label">CPU</span>
+                                <span class="status-value" id="mon-cpu">-</span>
+                            </div>
+                            <div class="status-item">
+                                <span class="status-label">Memory</span>
+                                <span class="status-value" id="mon-memory">-</span>
+                            </div>
+                            <div class="status-item">
+                                <span class="status-label">Heartbeat</span>
+                                <span class="status-value" id="mon-heartbeat">-</span>
+                            </div>
+                            <div class="status-item">
+                                <span class="status-label">Last Log</span>
+                                <span class="status-value truncate" id="mon-lastlog" title="">-</span>
+                            </div>
+                        </div>
                 </div>
             </section>
             
@@ -335,6 +375,42 @@
                 </div>
             </section>
             
+            <!-- Live Console -->
+            <section class="card console-card" id="section-console">
+                <div class="card-header">
+                    <h2>Live Console</h2>
+                    <div class="console-tools">
+                        <select id="console-level" class="console-select" aria-label="Filter by level">
+                            <option value="">All levels</option>
+                            <option value="info">Info</option>
+                            <option value="warn">Warn</option>
+                            <option value="error">Error</option>
+                            <option value="debug">Debug</option>
+                        </select>
+                        <input type="search" id="console-search" class="console-search" placeholder="Filter..." aria-label="Filter log text">
+                        <button class="btn btn-secondary btn-sm" id="console-pause" title="Pause auto-scroll">Pause</button>
+                        <button class="btn btn-secondary btn-sm" id="console-clear" title="Clear this view">Clear</button>
+                    </div>
+                </div>
+                <div class="console-body">
+                    <div class="console-lines" id="console-lines" aria-live="polite">
+                        <p class="empty-state">Waiting for log lines from the agent...</p>
+                    </div>
+                </div>
+                <div class="console-footer">
+                    <form id="console-form" autocomplete="off">
+                        <input type="text" id="console-input" class="console-input"
+                               placeholder="Minecraft command (e.g. list, say hi, save-all)"
+                               maxlength="500" aria-label="Console command">
+                        <button type="submit" class="btn btn-primary btn-sm" id="console-send">Send</button>
+                    </form>
+                    <label class="console-autoscroll">
+                        <input type="checkbox" id="console-autoscroll" checked> Auto-scroll
+                    </label>
+                    <span class="console-conn" id="console-conn"><span class="status-dot"></span> idle</span>
+                </div>
+            </section>
+
             <!-- Recent Events -->
             <section class="card events-card">
                 <div class="card-header">
