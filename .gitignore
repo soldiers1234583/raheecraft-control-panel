@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+*.egg-info/
+
+# Secrets and credentials
+.env
+.env.*
+*.token
+*.key
+*.pem
+credentials.json
+*.secret
+
+# IDE
+.agents/
+.claude/
+.cline/
+.codex/
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Termux
+*.log
+*.pid
+
+# Kaggle output (temporary)
+/kaggle/
