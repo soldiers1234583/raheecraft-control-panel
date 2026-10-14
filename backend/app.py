@@ -183,10 +183,15 @@ rate_limiter = RateLimiter()
 
 
 def rate_limit(max_requests=None, window=None):
-    """Rate limit decorator."""
+    """Rate limit decorator.
+
+    Buckets are namespaced per endpoint + client: without this, a burst of
+    requests to any rate-limited route would consume the stricter power
+    action budget (5/min) and cause cross-endpoint 429s.
+    """
     def decorator(f):
         def wrapper(*args, **kwargs):
-            key = request.remote_addr or "unknown"
+            key = f"{f.__name__}:{request.remote_addr or 'unknown'}"
             mr = max_requests or config.RATE_LIMIT_REQUESTS
             wn = window or config.RATE_LIMIT_WINDOW_SECONDS
             
@@ -884,10 +889,20 @@ def get_monitoring():
     # to null with a note instead.
     agent = agent_status or {}
 
-    # Server process state comes from the agent heartbeat (Kaggle side)
+    # Server process state comes from the agent heartbeat (Kaggle side).
+    # "measured" means the data is FRESH (agent online) — a stale heartbeat
+    # is reported with its age instead of being presented as current.
+    data_fresh = bool(online_agents)
     paper_running = bool(agent and agent.get("paper_status") == "running")
     last_hb = agent.get("last_heartbeat")
     hb_age = (time.time() - last_hb) if last_hb else None
+    if data_fresh:
+        process_note = None
+    elif agent_status:
+        process_note = (f"stale heartbeat ({int(hb_age)}s ago)"
+                        if hb_age is not None else "stale heartbeat")
+    else:
+        process_note = "no agent heartbeat data"
 
     # Paper memory/CPU: agent reports system-wide metrics; per-process
     # Java memory is not measurable remotely → null with reason.
@@ -908,8 +923,8 @@ def get_monitoring():
         "process": {
             "state": "online" if paper_running else "offline",
             "pid": agent.get("paper_pid") if agent else None,
-            "measured": bool(agent_status),
-            "note": None if agent_status else "no agent heartbeat data",
+            "measured": data_fresh,
+            "note": process_note,
         },
         "uptime_seconds": (agent.get("uptime_seconds") if agent else None)
                           if paper_running else 0,
@@ -919,14 +934,15 @@ def get_monitoring():
             "note": None if paper_running else "server not running",
         },
         "memory": {
-            "system_percent": agent.get("cpu_percent") and agent.get("memory_percent"),
+            "system_percent": agent.get("memory_percent"),
             "memory_percent": agent.get("memory_percent") if agent else None,
             "java_rss_mb": java_memory_mb,
-            "note": mem_note or ("no agent data" if not agent_status else None),
+            "note": (mem_note + " — " + process_note) if (mem_note and not data_fresh)
+                    else (mem_note or (process_note if not data_fresh else None)),
         },
         "cpu": {
             "percent": agent.get("cpu_percent") if agent else None,
-            "note": None if agent_status else "no agent data",
+            "note": None if data_fresh else process_note,
         },
         "agent": {
             "online": bool(online_agents),

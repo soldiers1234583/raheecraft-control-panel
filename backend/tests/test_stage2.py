@@ -409,3 +409,97 @@ class TestRedactText(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestAgentDisconnect(unittest.TestCase):
+    """Stale heartbeat → agent offline → backend degrades, never fakes online."""
+
+    def setUp(self):
+        from backend.agent_handler import agent_handler
+        self.ah = agent_handler
+        self.cookies = login_cookies()
+        if "agent-stale01" not in self.ah.agents:
+            self.ah.register_agent("agent-stale01", "secret-stale-0123456789")
+
+    def test_stale_heartbeat_marks_agent_offline(self):
+        from backend.agent_handler import agent_handler
+        agent_handler.agents["agent-stale01"]["last_heartbeat"] = (
+            time.time() - 600)  # 10 minutes ago > 90s timeout
+        self.assertFalse(
+            agent_handler.is_agent_online("agent-stale01"))
+
+    def test_power_endpoint_503_when_agent_stale(self):
+        from backend.agent_handler import agent_handler
+        agent_handler.agents["agent-stale01"]["last_heartbeat"] = (
+            time.time() - 600)
+        code, resp = _call_app("/api/admin/server/start", "POST", "{}",
+                               cookies=self.cookies)
+        self.assertEqual(code, 503)
+        self.assertEqual(resp.get("state"), "agent_offline")
+
+    def test_monitoring_reports_agent_offline(self):
+        from backend.agent_handler import agent_handler
+        agent_handler.agents["agent-stale01"]["last_heartbeat"] = (
+            time.time() - 600)
+        code, resp = _call_app("/api/admin/monitoring", cookies=self.cookies)
+        self.assertEqual(code, 200)
+        self.assertFalse(resp["agent"]["online"])
+        self.assertFalse(resp["process"]["measured"])
+
+
+class TestMalformedPayloads(unittest.TestCase):
+    """Malformed/invalid payloads are rejected with clear JSON errors."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.cookies = login_cookies()
+        from backend.agent_handler import agent_handler
+        cls.ah = agent_handler
+        if "agent-payload01" not in cls.ah.agents:
+            cls.ah.register_agent("agent-payload01", "secret-payload-0123456789")
+        cls.agent_headers = {
+            "X-Agent-ID": "agent-payload01",
+            "X-Agent-Token": "secret-payload-0123456789",
+        }
+
+    def test_action_result_invalid_state_rejected(self):
+        code, resp = _call_app(
+            "/api/agent/actions/some-id", "POST",
+            json.dumps({"state": "awesome"}),
+            headers=self.agent_headers)
+        self.assertEqual(code, 400)
+        self.assertIn("state", resp.get("error", ""))
+
+    def test_action_result_unknown_action_404(self):
+        code, resp = _call_app(
+            "/api/agent/actions/does-not-exist", "POST",
+            json.dumps({"state": "success"}),
+            headers=self.agent_headers)
+        self.assertEqual(code, 404)
+
+    def test_log_push_non_list_rejected(self):
+        code, resp = _call_app(
+            "/api/agent/logs", "POST",
+            json.dumps({"lines": "not-a-list"}),
+            headers=self.agent_headers)
+        self.assertEqual(code, 400)
+
+    def test_log_push_too_many_lines_rejected(self):
+        code, resp = _call_app(
+            "/api/agent/logs", "POST",
+            json.dumps({"lines": ["x"] * 501}),
+            headers=self.agent_headers)
+        self.assertEqual(code, 400)
+
+    def test_console_oversized_command_rejected(self):
+        code, resp = _call_app(
+            "/api/admin/server/console", "POST",
+            json.dumps({"command": "say " + "x" * 600}),
+            cookies=self.cookies)
+        self.assertEqual(code, 400)
+
+    def test_unknown_action_type_still_rejected_by_relay(self):
+        from backend.command_handler import command_handler
+        with self.assertRaises(ValueError):
+            command_handler.queue_for_agent("exec_shell", {},
+                                            agent_id="agent-payload01")
