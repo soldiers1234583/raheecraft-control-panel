@@ -29,6 +29,7 @@ import time
 import unittest
 import tempfile
 import shutil
+from pathlib import Path
 from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(
@@ -104,15 +105,28 @@ def _call_app(path, method="GET", body=None, cookies=None, headers=None,
     return code, parsed
 
 
+_LOGIN_CACHE = {}
+
+
 def login_cookies():
+    """Log in as admin, caching the session for the test process.
+
+    Each test only needs some valid admin session; logging in per test would
+    trip the login endpoint's rate limit (test-harness artifact, not a
+    product behaviour).
+    """
     from backend.config import config as cfg
     from backend.auth import hash_secret
     if not getattr(cfg, "ADMIN_PASSWORD_HASH", None):
         cfg.ADMIN_PASSWORD_HASH = hash_secret("test-password-123")
+    cached = _LOGIN_CACHE.get("cookies")
+    if cached and cfg.validate_session(cached["raheecraft_session"]):
+        return dict(cached)
     code, resp = _call_app(
         "/api/auth/login", "POST",
         json.dumps({"username": "admin", "password": "test-password-123"}))
     assert code == 200, resp
+    _LOGIN_CACHE["cookies"] = {"raheecraft_session": resp["session_id"]}
     return {"raheecraft_session": resp["session_id"]}
 
 
@@ -847,6 +861,242 @@ class TestAuditAndHistory(Stage3EndpointBase):
         self.assertTrue(outcomes)
         self.assertEqual(outcomes[-1]["details"]["state"], "failed")
         self.assertEqual(outcomes[-1]["details"]["target"], "Steve")
+
+
+class TestLogFileEndpoints(unittest.TestCase):
+    """The log-history endpoints read a real file.
+
+    Both `/api/logs` and `/api/admin/console/logs` call
+    `server_status.get_log_path()`. That method did not exist, so both
+    endpoints answered 500 on every request; nothing covered them, so the
+    dashboard's log history was silently broken. These tests point the
+    backend at a temporary server directory and go through the HTTP layer, so
+    a missing/renamed method (or an unreadable encoding) fails here.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.cookies = login_cookies()
+
+    def setUp(self):
+        from backend.server_status import server_status
+        self.server_status = server_status
+        self._real_dir = server_status.server_dir
+        self.dir = tempfile.mkdtemp(prefix="rahee-logs-")
+        os.makedirs(os.path.join(self.dir, "logs"), exist_ok=True)
+        server_status.server_dir = Path(self.dir)
+
+    def tearDown(self):
+        self.server_status.server_dir = self._real_dir
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def write_log(self, lines):
+        path = os.path.join(self.dir, "logs", "latest.log")
+        with open(path, "wb") as fh:
+            fh.write(b"\n".join(l.encode("utf-8") for l in lines) + b"\n")
+        return path
+
+    def test_log_path_default_and_override(self):
+        """Canonical path is logs/latest.log; LOG_FILE overrides it."""
+        path = self.server_status.get_log_path()
+        self.assertEqual(str(path),
+                         os.path.join(self.dir, "logs", "latest.log"))
+        with patch.dict(os.environ, {"LOG_FILE": "/tmp/custom-server.log"}):
+            self.assertEqual(str(self.server_status.get_log_path()),
+                             "/tmp/custom-server.log")
+
+    def test_console_logs_returns_lines(self):
+        self.write_log(["[INFO] Starting server", "[INFO] Done (1.0s)!",
+                        "[INFO] Steve joined the game"])
+        code, resp = _call_app("/api/admin/console/logs",
+                               cookies=self.cookies)
+        self.assertEqual(code, 200, resp)
+        self.assertEqual(resp["total"], 3)
+        self.assertIn("Steve joined the game", resp["lines"][-1])
+
+    def test_console_logs_filter_search_limit(self):
+        self.write_log([f"[INFO] line {i}" for i in range(50)] +
+                       ["[WARN] something odd"])
+        code, resp = _call_app("/api/admin/console/logs", query="search=odd",
+                               cookies=self.cookies)
+        self.assertEqual(code, 200)
+        self.assertEqual(resp["filtered"], 1)
+        self.assertEqual(resp["lines"], ["[WARN] something odd"])
+
+        code, resp = _call_app("/api/admin/console/logs", query="limit=5",
+                               cookies=self.cookies)
+        self.assertEqual(code, 200)
+        self.assertEqual(len(resp["lines"]), 5)
+
+    def test_console_logs_missing_file_is_empty_not_500(self):
+        """No server on this host yet is a normal state, not an error."""
+        code, resp = _call_app("/api/admin/console/logs",
+                               cookies=self.cookies)
+        self.assertEqual(code, 200)
+        self.assertEqual(resp["lines"], [])
+        self.assertEqual(resp["total"], 0)
+
+    def test_non_utf8_locale_content_still_served(self):
+        """Paper logs are UTF-8; a locale-less host must not 500 on them."""
+        self.write_log(["[INFO] Player \u00c9mile \u2014 joined the game"])
+        code, resp = _call_app("/api/admin/console/logs",
+                               cookies=self.cookies)
+        self.assertEqual(code, 200, resp)
+        self.assertIn("joined the game", resp["lines"][0])
+
+    def test_logs_endpoint_returns_lines(self):
+        self.write_log(["[INFO] hello", "[INFO] world"])
+        code, resp = _call_app("/api/logs", cookies=self.cookies)
+        self.assertEqual(code, 200, resp)
+        self.assertEqual(resp["lines"], ["[INFO] hello", "[INFO] world"])
+        self.assertEqual(resp["total_lines"], 2)
+
+    def test_log_endpoints_require_auth(self):
+        self.assertEqual(_call_app("/api/admin/console/logs")[0], 401)
+        self.assertEqual(_call_app("/api/logs")[0], 401)
+
+
+class TestHeartbeatViewContract(unittest.TestCase):
+    """What the agent POSTs must actually reach the panel.
+
+    The heartbeat *view* used to rebuild the payload from a hand-written subset
+    of keys, so `player_snapshot` and the crash/restart fields never arrived:
+    the agent showed as online while every player panel stayed on "agent has
+    not reported player data yet". These tests go through the HTTP endpoint,
+    not `agent_handler` directly — the older snapshot tests injected straight
+    into the handler, which is exactly why the dropped fields went unnoticed.
+    """
+
+    AGENT_ID = "agent-hb-view-01"
+    SECRET = "hb-view-secret-0123456789abcdef"
+
+    def setUp(self):
+        command_handler.actions.clear()
+        agent_handler.agents.pop(self.AGENT_ID, None)
+        agent_handler.register_agent(self.AGENT_ID, self.SECRET)
+        # Leave the shared registry as it was found: other tests assert what a
+        # request does when no agent is online, and a heartbeating agent left
+        # behind here made those see this one instead.
+        self.addCleanup(agent_handler.agents.pop, self.AGENT_ID, None)
+
+    def _heartbeat(self, payload):
+        return _call_app("/api/agent/heartbeat", "POST", json.dumps(payload),
+                         headers={"X-Agent-ID": self.AGENT_ID,
+                                  "X-Agent-Token": self.SECRET})
+
+    def _only_my_agent_online(self):
+        """The player endpoints report the first ONLINE agent, so quiet the
+        others for the duration of a test instead of depending on test order."""
+        saved = {}
+        for agent_id, info in agent_handler.agents.items():
+            if agent_id != self.AGENT_ID:
+                saved[agent_id] = info.get("last_heartbeat")
+                info["last_heartbeat"] = time.time() - 10_000
+        self.addCleanup(self._restore_heartbeats, saved)
+
+    @staticmethod
+    def _restore_heartbeats(saved):
+        for agent_id, value in saved.items():
+            if agent_id in agent_handler.agents:
+                agent_handler.agents[agent_id]["last_heartbeat"] = value
+
+    def test_heartbeat_requires_credentials(self):
+        code, _ = _call_app("/api/agent/heartbeat", "POST", "{}")
+        self.assertEqual(code, 401)
+
+    def test_player_snapshot_reaches_the_panel(self):
+        snapshot = {
+            "ts": time.time(),
+            "online": [{"username": "Steve", "uuid": "u1",
+                        "session_seconds": 12}],
+            "whitelist": {"enabled": True,
+                          "entries": [{"username": "Steve"}]},
+            "bans": [],
+            "ops": [{"username": "Steve", "level": 4}],
+            "luckperms": {"installed": True, "operational": True},
+        }
+        code, resp = self._heartbeat({"paper_running": True, "paper_pid": 4242,
+                                      "player_snapshot": snapshot})
+        self.assertEqual(code, 200, resp)
+        self._only_my_agent_online()
+
+        code, resp = _call_app("/api/admin/players", cookies=login_cookies())
+        self.assertEqual(code, 200)
+        self.assertTrue(resp["available"], resp)
+        self.assertEqual([p["username"] for p in resp["online"]], ["Steve"])
+
+        code, resp = _call_app("/api/admin/whitelist", cookies=login_cookies())
+        self.assertEqual(code, 200)
+        self.assertTrue(resp["available"])
+        self.assertTrue(resp["enabled"])
+        self.assertEqual(len(resp["entries"]), 1)
+
+        code, resp = _call_app("/api/admin/operators", cookies=login_cookies())
+        self.assertEqual(code, 200)
+        self.assertTrue(resp["available"])
+        self.assertEqual(len(resp["operators"]), 1)
+
+    def test_lifecycle_and_crash_fields_reach_the_panel(self):
+        code, resp = self._heartbeat({
+            "server_state": "CRASHED",
+            "desired_state": "RUNNING",
+            "paper_running": False,
+            "exit_code": 137,
+            "restart_attempts": 2,
+            "paper_startup_state": "failed",
+            "last_error": "The server has stopped without saving",
+            "log_tail": "line one\nline two",
+        })
+        self.assertEqual(code, 200, resp)
+
+        status = agent_handler.get_agent_status(self.AGENT_ID)
+        self.assertEqual(status["server_state"], "CRASHED")
+        self.assertEqual(status["desired_state"], "RUNNING")
+        self.assertEqual(status["exit_code"], 137)
+        self.assertEqual(status["restart_attempts"], 2)
+        self.assertEqual(status["paper_startup_state"], "failed")
+        self.assertIn("stopped without saving", status["last_error"])
+        self.assertIn("line two", status["log_tail"])
+
+    def test_caps_and_allowlists_still_apply_through_the_view(self):
+        from backend.agent_handler import MAX_ERROR_CHARS, MAX_LOG_TAIL_CHARS
+
+        code, _ = self._heartbeat({
+            "server_state": "BANANA",           # not a lifecycle state
+            "restart_attempts": -5,              # negative is clamped to 0
+            "log_tail": "x" * (MAX_LOG_TAIL_CHARS + 500),
+            "last_error": "e" * (MAX_ERROR_CHARS + 500),
+        })
+        self.assertEqual(code, 200)
+
+        status = agent_handler.get_agent_status(self.AGENT_ID)
+        self.assertNotEqual(status["server_state"], "BANANA")
+        self.assertEqual(status["restart_attempts"], 0)
+        self.assertEqual(len(status["log_tail"]), MAX_LOG_TAIL_CHARS)
+        self.assertEqual(len(status["last_error"]), MAX_ERROR_CHARS)
+
+    def test_a_snapshot_over_the_caps_is_stored_capped(self):
+        """A server with more bans than the cap must not blow up the panel."""
+        code, _ = self._heartbeat({
+            "paper_running": True,
+            "player_snapshot": {"ts": time.time(),
+                                "bans": [{"username": f"p{i}"} for i in range(600)]},
+        })
+        self.assertEqual(code, 200)
+        snap = agent_handler.get_agent_status(self.AGENT_ID)["player_snapshot"]
+        self.assertEqual(len(snap["bans"]), 500)
+
+    def test_a_payload_beyond_bottles_request_limit_is_refused(self):
+        """Bottle caps a request body at MEMFILE_MAX (100 KiB); a heartbeat
+        larger than that is refused outright rather than half-parsed."""
+        huge = {"paper_running": True,
+                "player_snapshot": {"ts": time.time(),
+                                    "bans": [{"username": "p" * 60} for _ in range(4000)]}}
+        code, _ = self._heartbeat(huge)
+        self.assertEqual(code, 413)
+        # and the stored snapshot is untouched by the refused request
+        status = agent_handler.get_agent_status(self.AGENT_ID)
+        self.assertIsNone(status["player_snapshot"])
 
 
 class TestRedaction(unittest.TestCase):

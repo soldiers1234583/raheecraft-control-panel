@@ -20,6 +20,13 @@ class Config:
 
     # Minecraft server directory (Kaggle path unless overridden)
     SERVER_DIR: str = os.environ.get("SERVER_DIR", "/kaggle/working/minecraft_server")
+
+    # Google Drive world backups. Off unless the runtime turns it on; the panel
+    # reports the boolean either way. (/api/backup/status used to raise
+    # AttributeError here — a 500 on every dashboard load — because the view
+    # read a setting Config never defined.)
+    ENABLE_DRIVE_BACKUP: bool = (
+        os.environ.get("ENABLE_DRIVE_BACKUP", "false").lower() == "true")
     
     # Secret key for sessions (auto-generated if not set)
     SECRET_KEY: str = os.environ.get("SECRET_KEY", secrets.token_hex(32))
@@ -27,6 +34,14 @@ class Config:
     # Admin password: bcrypt-free salted hash (set by main() from
     # ADMIN_PASSWORD, or provided directly via ADMIN_PASSWORD_HASH env).
     ADMIN_PASSWORD_HASH: str = os.environ.get("ADMIN_PASSWORD_HASH", "")
+
+    # Admin username. The panel has a single admin password, so the username a
+    # visitor types must not decide whether they get admin rights: the verified
+    # password does. This is the identity a successful login is given (and the
+    # one require_admin checks against).
+    ADMIN_USERNAME: str = (os.environ.get("DEFAULT_ADMIN_USER")
+                           or os.environ.get("ADMIN_USERNAME")
+                           or "admin")
     
     # Agent authentication
     AGENT_TOKEN_HEADER: str = "X-Agent-Token"

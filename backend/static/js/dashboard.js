@@ -37,14 +37,22 @@ const Dashboard = {
 
     /**
      * Check if user is logged in
+     *
+     * The session cookie is HttpOnly on purpose, so `document.cookie` can never
+     * contain it: any client-side test for it is a guaranteed false negative,
+     * which bounced a freshly signed-in user straight back to /login (observed
+     * live). The server renders the answer into the page instead, and a real
+     * 401 from any API call is still handled by redirecting from the fetch
+     * helpers.
      */
     checkLogin() {
-        const cookie = document.cookie;
-        if (!cookie.includes('raheecraft_session=')) {
+        const flag = document.body && document.body.getAttribute('data-logged-in');
+        if (flag === '0') {
             window.location.href = '/login';
             return;
         }
-        document.getElementById('username').textContent = 'Admin';
+        const usernameEl = document.getElementById('username');
+        if (usernameEl) usernameEl.textContent = 'Admin';
     },
 
     /**
@@ -372,39 +380,73 @@ const Dashboard = {
         const agent = data.agent || {};
         const agentOnline = !!(agent.online && agent.agents && agent.agents.length);
 
-        if (this.activeAction) {
-            // A power action is in flight — keep the derived state
-        } else if (agentOnline && server.paper_running) {
-            this.setPowerState('online', 'Paper process running');
-        } else if (agentOnline) {
-            this.setPowerState('offline', 'Agent connected, server not running');
+        // The live server is on the Kaggle host, so its lifecycle state comes
+        // from the agent. The backend's own filesystem reading is not evidence
+        // about the server and is never used to decide the power state.
+        const serverState = server.server_state
+            || (server.paper_running ? 'RUNNING' : 'STOPPED');
+        const running = serverState === 'RUNNING';
+        const busy = !!this.activeAction;
+
+        // State machine → what the user sees.
+        const display = {
+            RUNNING:    ['online', 'Paper is running and accepting connections'],
+            STARTING:   ['starting', 'Starting Paper (waiting for real readiness)'],
+            RESTARTING: ['restarting', 'Restarting'],
+            STOPPING:   ['stopping', 'Stopping and saving the world'],
+            STOPPED:    ['offline', 'Server stopped'],
+            CRASHED:    ['error', server.last_error || 'Server crashed'],
+        };
+
+        if (busy) {
+            // A power request is in flight; watchAction() owns the label.
+        } else if (!agentOnline) {
+            this.setPowerState('error',
+                'Agent offline — start the Kaggle notebook (Cell 8)');
         } else {
-            this.setPowerState('error', 'Agent offline — start the Kaggle notebook');
+            const entry = display[serverState] || ['unknown', serverState];
+            this.setPowerState(entry[0], entry[1]);
         }
 
-        if (server.exists) {
-            statusBadge.className = 'status-badge ' + (server.paper_running ? 'online' : 'offline');
-            statusBadge.querySelector('.status-text').textContent =
-                server.paper_running ? 'Online' : 'Offline';
-            serverStatusEl.textContent = server.paper_running ? 'Running' : 'Stopped';
-            serverStatusEl.style.color = server.paper_running ? 'var(--success)' : 'var(--danger)';
+        // Buttons follow the lifecycle state so a crash can be retried and a
+        // stopped server cannot be stopped twice.
+        const canStart = agentOnline && !running && serverState !== 'STARTING'
+            && serverState !== 'STOPPING' && serverState !== 'RESTARTING';
+        const canStop = agentOnline && (running || serverState === 'STARTING'
+            || serverState === 'RESTARTING');
 
-            const busy = !!this.activeAction;
-            document.getElementById('btn-start').disabled = busy || server.paper_running || !agentOnline;
-            document.getElementById('btn-stop').disabled = busy || !server.paper_running || !agentOnline;
-            document.getElementById('btn-restart').disabled = busy || !server.paper_running || !agentOnline;
+        statusBadge.className = 'status-badge ' + (running ? 'online' : 'offline');
+        statusBadge.querySelector('.status-text').textContent =
+            running ? 'Online' : 'Offline';
+        serverStatusEl.textContent = {
+            RUNNING: 'Running', STARTING: 'Starting', RESTARTING: 'Restarting',
+            STOPPING: 'Stopping', STOPPED: 'Stopped', CRASHED: 'Crashed'
+        }[serverState] || serverState;
+        serverStatusEl.style.color = running ? 'var(--success)'
+            : (serverState === 'CRASHED' ? 'var(--danger)' : 'var(--text-muted)');
 
-            serverVersionEl.textContent = server.version || '-';
-            serverPlayersEl.textContent = '-';
-            serverWorldEl.textContent = server.world_exists ? 'Exists' : 'No world';
-            serverWorldEl.style.color = server.world_exists ? 'var(--success)' : 'var(--text-muted)';
+        document.getElementById('btn-start').disabled = busy || !canStart;
+        document.getElementById('btn-stop').disabled = busy || !canStop;
+        document.getElementById('btn-restart').disabled = busy || !canStop;
+
+        // The world/version facts exist only where the files are; show what we
+        // have and say plainly when we do not have it.
+        serverVersionEl.textContent = server.version || '-';
+        serverPlayersEl.textContent = '-';
+        if (server.world_exists) {
+            serverWorldEl.textContent = 'Exists';
+            serverWorldEl.style.color = 'var(--success)';
+        } else if (server.source === 'agent') {
+            serverWorldEl.textContent = 'unknown (agent does not report it)';
+            serverWorldEl.style.color = 'var(--text-muted)';
         } else {
-            statusBadge.className = 'status-badge offline';
-            statusBadge.querySelector('.status-text').textContent = 'Not Set Up';
-            serverStatusEl.textContent = 'No server';
-            ['btn-start', 'btn-stop', 'btn-restart'].forEach(id => {
-                document.getElementById(id).disabled = true;
-            });
+            serverWorldEl.textContent = 'No world on the backend host';
+            serverWorldEl.style.color = 'var(--text-muted)';
+        }
+
+        // Surface a crash reason where the user is already looking.
+        if (serverState === 'CRASHED' && server.last_error && !busy) {
+            this.showMessage('error', `Server crashed: ${server.last_error}`);
         }
 
         // Agent card
@@ -430,9 +472,18 @@ const Dashboard = {
         const playit = data.playit || {};
         const playitStatusEl = document.getElementById('playit-status');
         const playitAddressEl = document.getElementById('playit-java-address');
-        if (playit.running && playit.hostname) {
+        const playitHost = playit.hostname
+            || (typeof playit.address === 'string' ? playit.address.split(':')[0] : null);
+        const playitPort = playit.port
+            || (typeof playit.address === 'string' ? playit.address.split(':')[1] : null);
+        if (playit.running && playitHost) {
             playitStatusEl.innerHTML = '<span class="status-dot" style="background: var(--success)"></span> Active';
-            playitAddressEl.textContent = `${playit.hostname}:${playit.port}`;
+            playitAddressEl.textContent = playitPort ? `${playitHost}:${playitPort}` : playitHost;
+        } else if (playit.running) {
+            // The connector is up but no public address has been proven yet;
+            // do not print a guess.
+            playitStatusEl.innerHTML = '<span class="status-dot" style="background: var(--warning, gold)"></span> Connected, address unknown';
+            playitAddressEl.textContent = 'not reported yet';
         } else {
             playitStatusEl.innerHTML = '<span class="status-dot" style="background: var(--text-muted)"></span> Not connected';
             playitAddressEl.textContent = '-';

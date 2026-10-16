@@ -10,6 +10,16 @@ from typing import Optional, Dict, Any
 from backend.config import config
 from backend.auth import redact_for_log
 
+# Lifecycle states the agent may report. Anything else is refused rather than
+# rendered, so a corrupted/older agent cannot put an unknown state on screen.
+LIFECYCLE_STATES = (
+    "STOPPED", "STARTING", "RUNNING", "STOPPING", "CRASHED", "RESTARTING",
+)
+DESIRED_STATES = ("RUNNING", "STOPPED")
+# Cap on the crash/log tail the agent may attach to a heartbeat.
+MAX_ERROR_CHARS = 600
+MAX_LOG_TAIL_CHARS = 2000
+
 
 class AgentHandler:
     """Handles agent lifecycle and status."""
@@ -29,6 +39,13 @@ class AgentHandler:
             "last_heartbeat": None,
             "last_seen": time.time(),
             "paper_status": "unknown",
+            "server_state": "STOPPED",
+            "desired_state": "STOPPED",
+            "paper_startup_state": "unknown",
+            "restart_attempts": 0,
+            "exit_code": None,
+            "last_error": None,
+            "log_tail": None,
             "playit_status": "unknown",
             "drive_status": "unknown",
             "cpu_percent": None,
@@ -74,6 +91,25 @@ class AgentHandler:
             agent["paper_status"] = "running" if status["paper_running"] else "stopped"
         if "paper_pid" in status:
             agent["paper_pid"] = status["paper_pid"]
+        # Lifecycle state machine (authoritative power state for the panel).
+        reported_state = status.get("server_state")
+        if reported_state in LIFECYCLE_STATES:
+            agent["server_state"] = reported_state
+        elif "paper_running" in status:
+            agent["server_state"] = ("RUNNING" if status["paper_running"]
+                                     else "STOPPED")
+        if status.get("desired_state") in DESIRED_STATES:
+            agent["desired_state"] = status["desired_state"]
+        if isinstance(status.get("paper_startup_state"), str):
+            agent["paper_startup_state"] = status["paper_startup_state"][:32]
+        if isinstance(status.get("restart_attempts"), int):
+            agent["restart_attempts"] = max(0, status["restart_attempts"])
+        if isinstance(status.get("exit_code"), int) or status.get("exit_code") is None:
+            agent["exit_code"] = status.get("exit_code")
+        err = status.get("last_error")
+        agent["last_error"] = (str(err)[:MAX_ERROR_CHARS] if err else None)
+        tail = status.get("log_tail")
+        agent["log_tail"] = (str(tail)[-MAX_LOG_TAIL_CHARS:] if tail else None)
         if "playit_running" in status:
             agent["playit_status"] = "running" if status["playit_running"] else "stopped"
         if "playit_address" in status:
@@ -110,6 +146,13 @@ class AgentHandler:
             "last_seen": agent["last_seen"],
             "paper_status": agent["paper_status"],
             "paper_pid": agent.get("paper_pid"),
+            "server_state": agent.get("server_state", "STOPPED"),
+            "desired_state": agent.get("desired_state", "STOPPED"),
+            "paper_startup_state": agent.get("paper_startup_state", "unknown"),
+            "restart_attempts": agent.get("restart_attempts", 0),
+            "exit_code": agent.get("exit_code"),
+            "last_error": agent.get("last_error"),
+            "log_tail": agent.get("log_tail"),
             "playit_status": agent["playit_status"],
             "playit_address": agent.get("playit_address"),
             "drive_last_backup": agent.get("drive_last_backup"),

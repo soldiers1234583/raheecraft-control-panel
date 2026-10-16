@@ -18,7 +18,7 @@ import logging
 from pathlib import Path
 
 from bottle import Bottle, request, response, template, redirect, abort
-from bottle import SimpleTemplate, TEMPLATE_PATH
+from bottle import SimpleTemplate, TEMPLATE_PATH, HTTPError, HTTPResponse
 
 # Ensure templates resolve regardless of the working directory (Render runs
 # from backend/, local runs often from the project root).
@@ -53,10 +53,20 @@ app = Bottle()
 # Middleware
 # =============================================================================
 
+# Paths whose payload is JSON. Bottle already serialises a returned dict as
+# application/json; this keeps that promise across the whole API surface
+# (and for abort() payloads) *without* stamping application/json on the HTML
+# pages. That stamp was a real defect: with X-Content-Type-Options: nosniff a
+# browser refuses to render "/" or "/login" and shows the markup as source
+# text instead of the panel.
+JSON_PATHS = ('/api/', '/health')
+
+
 @app.hook('before_request')
 def before_request():
     """Set response headers."""
-    response.content_type = 'application/json'
+    if request.path.startswith(JSON_PATHS):
+        response.content_type = 'application/json'
     response.headers['X-Content-Type-Options'] = 'nosniff'
 
 
@@ -124,7 +134,7 @@ def require_admin(f):
         if not session:
             abort(401, {"error": "Invalid or expired session"})
         
-        if session.get("user_id") != "admin":
+        if session.get("user_id") != config.ADMIN_USERNAME:
             abort(403, {"error": "Admin access required"})
         
         request.user_id = session["user_id"]
@@ -270,21 +280,21 @@ def agent_heartbeat():
     """
     try:
         data = request.json or {}
-        
-        # Build status dict
-        status = {
-            "paper_running": data.get("paper_running", False),
-            "paper_pid": data.get("paper_pid"),
-            "playit_running": data.get("playit_running", False),
-            "playit_address": data.get("playit_address"),
-            "drive_last_backup": data.get("drive_last_backup"),
-            "cpu_percent": data.get("cpu_percent"),
-            "memory_percent": data.get("memory_percent"),
-            "player_count": data.get("player_count"),
-            "uptime_seconds": data.get("uptime_seconds", 0),
-            "timestamp": time.time()
-        }
-        
+        if not isinstance(data, dict):
+            abort(400, {"error": "Heartbeat payload must be a JSON object"})
+
+        # Pass the agent's status through as sent. `AgentHandler.heartbeat`
+        # already validates every field it accepts: type checks per field, a
+        # lifecycle-state allowlist, and bounded/sanitised player snapshots.
+        # This view used to rebuild the payload from a hand-written subset of
+        # keys instead, which silently dropped `player_snapshot` and the
+        # crash/restart fields (last_error, log_tail, exit_code,
+        # restart_attempts, paper_startup_state): the agent heartbeated happily
+        # while the panel's player sections stayed on "agent has not reported
+        # player data yet" and crash reasons never appeared.
+        status = dict(data)
+        status["timestamp"] = time.time()
+
         success = agent_handler.heartbeat(request.agent_id, request.headers.get(config.AGENT_TOKEN_HEADER), status)
         
         if success:
@@ -292,7 +302,11 @@ def agent_heartbeat():
             return {"status": "ok"}
         else:
             abort(401, {"error": "Authentication failed"})
-    
+
+    except HTTPError:
+        # `abort()` raises HTTPError, which is an Exception: without this the
+        # intended 401 was swallowed and re-reported as a 500.
+        raise
     except Exception as e:
         logger.error(f"Heartbeat error: {e}")
         abort(500, {"error": "Internal error"})
@@ -322,8 +336,11 @@ def login():
             config.log_audit("login", username, {"success": False}, success=False)
             abort(401, {"error": "Invalid credentials"})
         
-        # Create session
-        session_id = config.create_session(username)
+        # Create session. The password is the credential (one admin account),
+        # so a successful login always gets the configured admin identity —
+        # otherwise a client typing e.g. "rahee" would hold a session that every
+        # /api/admin/* route rejects with 403.
+        session_id = config.create_session(config.ADMIN_USERNAME)
         
         # Set cookie
         response.set_cookie(
@@ -335,15 +352,22 @@ def login():
             max_age=3600  # 1 hour
         )
         
-        logger.info(f"User logged in: {username}")
-        config.log_audit("login", username, {"success": True}, success=True)
-        
+        logger.info(f"User logged in: {config.ADMIN_USERNAME}")
+        config.log_audit("login", config.ADMIN_USERNAME,
+                         {"success": True}, success=True)
+
         return {
             "status": "ok",
             "session_id": session_id,
-            "username": username
+            "username": config.ADMIN_USERNAME
         }
     
+    except HTTPError:
+        # `abort()` raises HTTPError, which is an Exception. Catching it here
+        # turned a wrong password (401) and a missing username/password (400)
+        # into a 500, so the dashboard could not tell "bad credentials" from
+        # "panel is broken".
+        raise
     except Exception as e:
         logger.error(f"Login error: {e}")
         abort(500, {"error": "Internal error"})
@@ -365,38 +389,117 @@ def logout():
 # Routes - Authenticated Users
 # =============================================================================
 
+def _playit_view(agent_status, server_info):
+    """Tunnel state in one shape, whichever side reported it.
+
+    A running connector with no proven public address is reported as
+    `running: True, address: None` — never with an invented host:port.
+    """
+    if agent_status is not None:
+        running = agent_status.get("playit_status") == "running"
+        address = agent_status.get("playit_address")
+    else:
+        local = server_info.get("playit") or {}
+        running = bool(local.get("running"))
+        if local.get("hostname"):
+            address = f"{local['hostname']}:{local.get('port')}"
+        else:
+            address = None
+
+    hostname = port = None
+    if isinstance(address, str) and address.count(":") == 1:
+        hostname, _, port = address.partition(":")
+    elif isinstance(address, str):
+        hostname = address
+
+    return {"running": bool(running), "address": address,
+            "hostname": hostname, "port": port}
+
+
 @app.route('/api/status')
 @require_user
 def get_status():
-    """Get server and agent status."""
-    agent_id = request.session_id  # For now, use session as agent reference
-    
-    # Get agent status (if any agent is registered)
+    """Server and agent status.
+
+    The live server runs on the Kaggle host, so the agent heartbeat is the
+    authority on whether it is up and in which lifecycle state. The backend's
+    own filesystem/process readings describe the *backend host* and are labelled
+    as such — reporting them as the server state made the panel show "Stopped"
+    (and enable Start) while Minecraft was actually running.
+    """
     agents_status = agent_handler.get_all_agents_status()
-    
-    # Get server status
+    online_agents = [a for a in agents_status
+                     if agent_handler.is_agent_online(a["agent_id"])]
+    agent_status = online_agents[0] if online_agents else (
+        agents_status[0] if agents_status else None)
+
     server_info = server_status.get_server_summary()
-    
-    # Determine overall status
-    agent_online = any(a["status"] == "online" for a in agents_status)
-    
+    heartbeat_fresh = bool(online_agents)
+
+    if agent_status is not None:
+        state = agent_status.get("server_state") or (
+            "RUNNING" if agent_status.get("paper_status") == "running"
+            else "STOPPED")
+        paper_running = agent_status.get("paper_status") == "running"
+        paper_pid = agent_status.get("paper_pid")
+        desired_state = agent_status.get("desired_state", "STOPPED")
+        startup_state = agent_status.get("paper_startup_state", "unknown")
+        last_error = agent_status.get("last_error")
+        restart_attempts = agent_status.get("restart_attempts", 0)
+        exit_code = agent_status.get("exit_code")
+        source = "agent" if heartbeat_fresh else "agent (stale heartbeat)"
+    else:
+        state = "RUNNING" if server_info["paper_running"] else "STOPPED"
+        paper_running = bool(server_info["paper_running"])
+        paper_pid = server_info["paper_pid"]
+        desired_state = None
+        startup_state = "unknown"
+        last_error = None
+        restart_attempts = 0
+        exit_code = None
+        source = "backend_host"
+
+    last_hb = agent_status.get("last_heartbeat") if agent_status else None
+
     return {
         "server": {
             "exists": server_info["server_exists"],
             "paper_jar": server_info["paper_jar_exists"],
             "eula_accepted": server_info["eula_accepted"],
-            "paper_running": server_info["paper_running"],
-            "paper_pid": server_info["paper_pid"],
+            "paper_running": paper_running,
+            "paper_pid": paper_pid,
             "version": server_info["minecraft_version"],
             "paper_version": server_info["paper_version"],
             "world_exists": server_info["world_exists"],
+            # Lifecycle detail (from the agent, the only component that can see
+            # the real server).
+            "server_state": state,
+            "desired_state": desired_state,
+            "startup_state": startup_state,
+            "restart_attempts": restart_attempts,
+            "exit_code": exit_code,
+            "last_error": last_error,
+            "source": source,
+            "heartbeat_fresh": heartbeat_fresh,
+            "last_heartbeat": last_hb,
+            "heartbeat_age_seconds": (
+                round(time.time() - last_hb, 1) if last_hb else None),
+            # Facts below describe the backend host itself when no agent is
+            # present, so they are never presented as the Kaggle server.
+            "local": {
+                "scope": server_info.get("scope", "backend_host"),
+                "server_dir": server_info.get("server_dir"),
+                "paper_running": server_info.get("paper_running_local", False),
+            },
         },
         "agent": {
-            "online": agent_online,
+            "online": heartbeat_fresh,
             "agents": agents_status
         },
-        "playit": server_info.get("playit", {"running": False}),
-        "backup": server_info.get("last_backup"),
+        "playit": _playit_view(agent_status, server_info),
+
+        "backup": (agent_status.get("drive_last_backup") if agent_status
+                   else server_info.get("last_backup")),
         "timestamp": server_info["timestamp"]
     }
 
@@ -411,8 +514,9 @@ def get_logs():
         return {"lines": [], "error": "No log file found"}
     
     try:
-        # Read last 100 lines
-        with open(log_path, 'r') as f:
+        # Read last 100 lines (UTF-8 with replacement: the log is not
+        # guaranteed to be ASCII-clean, and a decode error must not 500).
+        with open(log_path, 'r', encoding="utf-8", errors="replace") as f:
             lines = f.readlines()
         
         recent_lines = [line.rstrip() for line in lines[-100:]]
@@ -485,7 +589,8 @@ def get_audit_log():
 
 @app.route('/')
 def index():
-    """Serve the main dashboard."""
+    """Serve the main dashboard (HTML, not JSON)."""
+    response.content_type = 'text/html; charset=UTF-8'
     # Check if user is logged in
     session_id = request.get_cookie(config.SESSION_COOKIE_NAME)
     logged_in = False
@@ -512,10 +617,62 @@ def index():
     )
 
 
-@app.route('/login')
+@app.route('/login', method=['GET', 'POST'])
 def login_page():
-    """Serve login page."""
+    """Serve the login page (GET) and accept a plain form login (POST).
+
+    `login.html` must never submit as GET: a native GET submit puts the
+    password in the URL — browser history, proxy logs and this server's access
+    log — and logs nobody in (observed live on the published panel). The page's
+    JavaScript posts to `/api/auth/login`; this POST branch is the
+    no-JavaScript fallback, so the form still works when a script is blocked or
+    fails to load.
+    """
+    if request.method == 'POST':
+        return _form_login()
+    response.content_type = 'text/html; charset=UTF-8'
     return template('login.html', base_path=os.path.dirname(__file__))
+
+
+def _form_login():
+    """Verify a form-encoded login, then redirect. Same rules as the API.
+
+    The session cookie is set on the redirect response itself, so it is
+    guaranteed to travel with the 303. Nothing about the submission is echoed
+    back: the failure redirect carries only `error=1`.
+    """
+    if not rate_limiter.is_allowed(
+            f"form_login:{request.remote_addr or 'unknown'}", 10, 60):
+        return HTTPResponse(status=303, body=b"",
+                            headers={"Location": "/login?error=ratelimited"})
+
+    username = (request.forms.get('username') or '').strip()
+    password = request.forms.get('password') or ''
+    admin_hash = config.ADMIN_PASSWORD_HASH
+
+    # The typed username never decides access (one admin account, the password
+    # is the credential) and is deliberately not logged or echoed.
+    if not admin_hash or not verify_secret(password, admin_hash):
+        logger.warning("Failed login attempt (form)")
+        config.log_audit("login", username or "unknown",
+                         {"success": False}, success=False)
+        return HTTPResponse(status=303, body=b"",
+                            headers={"Location": "/login?error=1"})
+
+    session_id = config.create_session(config.ADMIN_USERNAME)
+    result = HTTPResponse(status=303, body=b"", headers={"Location": "/"})
+    result.set_cookie(
+        config.SESSION_COOKIE_NAME,
+        session_id,
+        path="/",
+        secure=config.SESSION_COOKIE_SECURE,
+        httponly=True,
+        max_age=3600,
+    )
+    logger.info(f"User logged in (form): {config.ADMIN_USERNAME}")
+    config.log_audit("login", config.ADMIN_USERNAME,
+                     {"success": True}, success=True)
+    return result
 
 
 @app.route('/static/<filename:path>')
@@ -540,8 +697,13 @@ def main():
     templates_dir = backend_dir / "templates"
     templates_dir.mkdir(parents=True, exist_ok=True)
     
-    # Create default admin if not set
-    admin_password = os.environ.get("ADMIN_PASSWORD")
+    # Create default admin if not set. `.env`/Render use ADMIN_PASSWORD; the
+    # Kaggle notebook cell loads the secret as DEFAULT_ADMIN_PASS. Accepting
+    # only ADMIN_PASSWORD meant a kernel launched from that cell started with
+    # no admin hash at all, so every login was refused with "Authentication
+    # not configured" — the panel was reachable behind a tunnel but unusable.
+    admin_password = (os.environ.get("ADMIN_PASSWORD")
+                      or os.environ.get("DEFAULT_ADMIN_PASS"))
     if admin_password and not config.ADMIN_PASSWORD_HASH:
         config.ADMIN_PASSWORD_HASH = hash_secret(admin_password)
         logger.info("Admin password configured")
@@ -741,7 +903,7 @@ def get_recent_logs():
         return {"lines": [], "total": 0}
     
     try:
-        lines = log_path.read_text().splitlines()
+        lines = log_path.read_bytes().decode("utf-8", errors="replace").splitlines()
         
         filter_type = request.query.filter or ""
         search = request.query.search or ""

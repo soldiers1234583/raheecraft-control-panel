@@ -27,7 +27,7 @@ import tempfile
 import subprocess
 import sys
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional, List, Tuple
 
 # ==== Configuration ====
@@ -36,6 +36,20 @@ BACKUP_FOLDER_NAME = "Minecraft-Server-Backups"
 MAX_BACKUPS = 5
 BACKUP_INTERVAL_SECONDS = 1800  # 30 minutes default
 DRY_RUN = False  # Set True to test without actual Drive operations
+
+# Player/service state Paper keeps in the server *root*, outside the world
+# folders: the op list, whitelist, bans and the name cache. It is backed up with
+# the worlds so operators, the whitelist and bans survive a new (ephemeral)
+# Kaggle session. Without it a player keeps their items but silently loses op,
+# and a banned player is unbanned, every session — the world comes back but the
+# server does not "remember" the players that go with it.
+SERVER_STATE_FILES = (
+    "ops.json",
+    "whitelist.json",
+    "banned-players.json",
+    "banned-ips.json",
+    "usercache.json",
+)
 
 # Google Drive OAuth scopes (least-privileged for file access)
 DRIVE_SCOPES = [
@@ -513,6 +527,10 @@ class GoogleDriveBackup:
             for name, path in worlds:
                 size = self._get_dir_size(path)
                 print(f"     - {name}: {size / (1024*1024):.1f} MB")
+        present = [n for n in SERVER_STATE_FILES
+                   if os.path.isfile(os.path.join(SERVER_DIR, n))]
+        if present:
+            print(f"   Would include player state: {', '.join(present)}")
         print("   Would upload to: " + BACKUP_FOLDER_NAME)
     
     def _get_dir_size(self, path: str) -> int:
@@ -549,6 +567,14 @@ class GoogleDriveBackup:
                             continue
                         
                         zf.write(file_path, arcname)
+
+            # Player/service state that lives in the server root, outside every
+            # world folder, so the world-only walk above never sees it.
+            for name in SERVER_STATE_FILES:
+                path = os.path.join(SERVER_DIR, name)
+                if os.path.isfile(path):
+                    print(f"   Adding {name}...")
+                    zf.write(path, name)
     
     def _get_latest_backup(self) -> Optional[dict]:
         """Get metadata for the most recent backup."""
@@ -573,30 +599,49 @@ class GoogleDriveBackup:
             return None
     
     def _worlds_unchanged(self, current_worlds: List[Tuple[str, str]], last_backup: dict) -> bool:
-        """
-        Check if worlds have changed since last backup.
-        
-        Compares directory modification times against backup time.
+        """True when nothing worth backing up has changed since the last backup.
+
+        Covers the world folders *and* the root player-state files.
+
+        Both sides of every comparison are UTC-aware: Drive reports the backup
+        time as an ISO-8601 instant (`...Z`) and file times are converted with
+        `tz=timezone.utc`. Comparing an aware time against a naive local one
+        raises TypeError — which aborted every automatic backup after the first
+        one, so the world was uploaded once per session and then never again.
         """
         if not last_backup:
             return False
-        
-        backup_time = datetime.fromisoformat(
-            last_backup.get('modifiedTime', '').replace('Z', '+00:00')
-        )
-        
+
+        raw = str(last_backup.get('modifiedTime', '')).strip()
+        try:
+            backup_time = datetime.fromisoformat(raw.replace('Z', '+00:00'))
+        except ValueError:
+            # An unparseable timestamp must not skip the backup: take a fresh one.
+            return False
+        if backup_time.tzinfo is None:
+            backup_time = backup_time.replace(tzinfo=timezone.utc)
+
+        def newer_than_backup(path: str) -> bool:
+            try:
+                mtime = datetime.fromtimestamp(os.path.getmtime(path),
+                                               tz=timezone.utc)
+            except OSError:
+                return False  # vanished between walk and stat: not a change
+            return mtime > backup_time
+
         for world_name, world_path in current_worlds:
             if not os.path.exists(world_path):
                 continue
-            
-            # Check if any file in world was modified after backup
             for dirpath, dirnames, filenames in os.walk(world_path):
                 for f in filenames:
-                    fp = os.path.join(dirpath, f)
-                    if os.path.exists(fp):
-                        mtime = datetime.fromtimestamp(os.path.getmtime(fp))
-                        if mtime > backup_time:
-                            return False
+                    if newer_than_backup(os.path.join(dirpath, f)):
+                        return False
+
+        # The root player-state files count as a change too, or a backup that
+        # only updated the whitelist/ops would be skipped as "unchanged".
+        for name in SERVER_STATE_FILES:
+            if newer_than_backup(os.path.join(SERVER_DIR, name)):
+                return False
         return True
     
     def _cleanup_old_backups(self, folder_id: str):

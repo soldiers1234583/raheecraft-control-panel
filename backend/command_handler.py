@@ -132,70 +132,53 @@ class CommandHandler:
                 action["result"] = result
     
     def _check_paper_running(self) -> tuple[bool, Optional[int]]:
-        """Check if Paper server is running."""
-        import subprocess
+        """Check if this server's Paper JVM is running on this host.
+
+        Uses the canonical detector (requires a real `java` process with this
+        server's `paper.jar` on its argv). The previous `pgrep -f paper.jar`
+        matched any process whose command line mentioned the substring, and so
+        reported a stopped server as running.
+
+        NOTE: the real server runs on Kaggle, not on the backend host. This
+        local check exists only for the fallback executor below; the
+        authoritative lifecycle is the agent's `ActionExecutor`, reached via
+        `queue_for_agent` / `complete_from_agent`.
+        """
         try:
-            result = subprocess.run(
-                ["pgrep", "-f", "paper.jar"],
-                capture_output=True,
-                text=True,
-                timeout=5
-            )
-            if result.returncode == 0 and result.stdout.strip():
-                pid = int(result.stdout.strip().split("\n")[0])
-                return True, pid
+            from agent.process_info import find_paper_pid
+            pid = find_paper_pid(self._server_dir)
+            return (pid is not None), pid
         except Exception:
-            pass
-        return False, None
+            return False, None
     
     def _start_paper(self, action: ActionResult) -> bool:
-        """Start the Paper server."""
+        """Refuse to start a Minecraft server on the backend host.
+
+        The server runs on Kaggle and is owned by the agent's lifecycle
+        manager (`agent.lifecycle.ServerLifecycle`), which is the only
+        component allowed to spawn a JVM. This Stage-1 fallback is deliberately
+        a no-op: a second launcher could open the same world concurrently,
+        which is precisely what the single authoritative lifecycle prevents.
+
+        Power actions reach the server through the agent relay
+        (`queue_for_agent` / `complete_from_agent`).
+        """
         # Check if already running
         running, pid = self._check_paper_running()
         if running:
             action["result"] = {"already_running": True, "pid": pid}
             return True
-        
+
         # Check if server jar exists
         if not Path(self._server_jar).exists():
             action["error"] = "paper.jar not found"
             return False
-        
-        # Check EULA
-        eula_path = Path(self._server_dir) / "eula.txt"
-        if eula_path.exists():
-            eula_content = eula_path.read_text()
-            if "eula=false" in eula_content.lower():
-                action["error"] = "EULA not accepted"
-                return False
-        
-        # Build command
-        cmd = [
-            "java",
-            f"-Xms{self._java_xms}m",
-            f"-Xmx{self._java_xmx}m",
-            "-jar", str(self._server_jar),
-            "nogui"
-        ]
-        
-        try:
-            # Start in server directory
-            process = subprocess.Popen(
-                cmd,
-                cwd=self._server_dir,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                preexec_fn=os.setsid if hasattr(os, 'setsid') else None
-            )
-            self._server_process = process
-            action["result"] = {
-                "pid": process.pid,
-                "command": " ".join(cmd)
-            }
-            return True
-        except Exception as e:
-            action["error"] = str(e)
-            return False
+
+        action["error"] = (
+            "Refusing to start Minecraft on the backend host. The server is "
+            "owned by the agent's lifecycle manager on the Kaggle runtime; "
+            "register the agent and use Start, which relays to it.")
+        return False
     
     def _stop_paper_graceful(self, action: ActionResult) -> bool:
         """
@@ -217,21 +200,13 @@ class CommandHandler:
             os.killpg(os.getpgid(pid), 15)  # SIGTERM
             action["result"] = {"signal": "SIGTERM", "pid": pid}
             
-            # Wait for process to terminate (up to 30 seconds)
-            try:
-                process = subprocess.Popen(
-                    ["pgrep", "-f", "paper.jar"],
-                    capture_output=True,
-                    text=True,
-                    timeout=30
-                )
-                # Wait for process to die
-                for _ in range(30):
-                    time.sleep(1)
-                    if not self._check_paper_running()[0]:
-                        break
-            except Exception:
-                pass
+            # Wait for the process to die, using the canonical detector rather
+            # than `pgrep -f paper.jar`, which matched any process whose command
+            # line merely mentioned the jar.
+            for _ in range(30):
+                time.sleep(1)
+                if not self._check_paper_running()[0]:
+                    break
             
             # Check if still running
             still_running, _ = self._check_paper_running()

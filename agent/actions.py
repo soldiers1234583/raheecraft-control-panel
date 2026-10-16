@@ -12,13 +12,20 @@ Runs on the Kaggle side where Paper lives. Security rules:
   - Stop uses Minecraft's own `stop` command so the world saves;
     SIGTERM only as a bounded fallback, SIGKILL only as last resort.
   - Never deletes or overwrites world data.
+
+Lifecycle ownership
+-------------------
+Power actions are NOT implemented here. They are delegated to
+`agent.lifecycle.ServerLifecycle`, the single component that owns the Paper
+process (state machine, desired_state, readiness, crash recovery). This
+executor keeps the security surface — allowlists, argument validation,
+confirmation against Paper's own state files — and nothing else, so two parts
+of the system can never each start their own JVM.
 """
 
 import os
 import sys
 import time
-import signal
-import subprocess
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
@@ -69,8 +76,13 @@ ALLOWED_CONSOLE_COMMANDS = {
 # shell/Python injection attempts — rejected outright.
 FORBIDDEN_CHARS = set("\n\r;|&`$><\\{}")
 
-STOP_TIMEOUT_SECONDS = int(os.environ.get("STOP_TIMEOUT_SECONDS", "60"))
-START_TIMEOUT_SECONDS = int(os.environ.get("START_TIMEOUT_SECONDS", "30"))
+# Timing for start/stop lives in `agent.lifecycle` and is read from the
+# environment at call time, so a notebook can raise the limits after import:
+#   START_TIMEOUT_SECONDS   readiness window (default 300; first-run world
+#                           generation is slow)
+#   STOP_TIMEOUT_SECONDS    graceful-shutdown window (default 180; Paper 1.21.x
+#                           saves every dimension and unwinds its worker pools
+#                           after the console `stop` is accepted)
 
 
 def validate_console_command(command: str) -> Tuple[bool, str]:
@@ -91,49 +103,53 @@ class ActionExecutor:
     """Executes allowlisted actions against the local Paper server."""
 
     def __init__(self, server_dir: str = None):
-        self.server_dir = Path(server_dir or config.SERVER_DIR)
-        self.server_jar = self.server_dir / "paper.jar"
-        self._console_proc: Optional[subprocess.Popen] = None
-        self._java_xms = os.environ.get("JAVA_XMS", "1024")
-        self._java_xmx = os.environ.get("JAVA_XMX", "2048")
+        self._server_dir_override = Path(server_dir) if server_dir else None
+
+    # --- lifecycle delegation ----------------------------------------------
+
+    @property
+    def server_dir(self) -> Path:
+        """Server directory, re-read from config unless explicitly overridden.
+
+        Previously this was cached at import, so a late change to
+        `config.SERVER_DIR` was silently ignored and the executor operated on a
+        stale path.
+        """
+        return self._server_dir_override or Path(config.SERVER_DIR)
+
+    @server_dir.setter
+    def server_dir(self, value) -> None:
+        self._server_dir_override = Path(value) if value else None
+
+    @property
+    def server_jar(self) -> Path:
+        return self.server_dir / "paper.jar"
+
+    @property
+    def lifecycle(self):
+        """The one lifecycle manager for this server directory."""
+        from agent.lifecycle import get_lifecycle
+        return get_lifecycle(self._server_dir_override)
 
     # --- process helpers ----------------------------------------------------
 
     def find_paper_pid(self) -> Optional[int]:
-        """Find the Paper server PID (paper.jar), or None."""
-        try:
-            result = subprocess.run(
-                ["pgrep", "-f", "paper.jar"],
-                capture_output=True, text=True, timeout=5,
-            )
-            if result.returncode == 0 and result.stdout.strip():
-                return int(result.stdout.strip().split("\n")[0])
-        except Exception:
-            pass
-        return None
+        """Find the Paper server PID (paper.jar), or None.
 
-    def _pid_alive(self, pid: int) -> bool:
-        try:
-            os.kill(pid, 0)
-            return True
-        except (ProcessLookupError, PermissionError):
-            return False
-        except Exception:
-            return False
+        Delegates to the canonical detector, which requires a real `java`
+        process with this server's `paper.jar` on its argv. A bare substring
+        match (the old `pgrep -f paper.jar`) wrongly matched editors, greps,
+        and the shell that launched the check, and made a stopped server look
+        running.
+        """
+        from agent.process_info import find_paper_pid
+        return find_paper_pid(self.server_dir)
 
     # --- console channel ----------------------------------------------------
 
     def _write_console(self, line: str) -> bool:
-        """Write a line to Paper's stdin if we own the process."""
-        proc = self._console_proc
-        if proc is None or proc.poll() is not None:
-            return False
-        try:
-            proc.stdin.write(line + "\n")
-            proc.stdin.flush()
-            return True
-        except Exception:
-            return False
+        """Write a line to Paper's console stdin (owned by the lifecycle)."""
+        return self.lifecycle.send_console(line)
 
     # --- actions ------------------------------------------------------------
 
@@ -169,142 +185,16 @@ class ActionExecutor:
         return {"state": "failed", "error": "Unhandled action", "result": {}}
 
     def _start(self) -> Dict[str, Any]:
-        pid = self.find_paper_pid()
-        if pid:
-            # Idempotent: already running is not an error
-            return {"state": "success", "error": None,
-                    "result": {"already_running": True, "pid": pid}}
-
-        if not self.server_jar.exists():
-            return {"state": "failed",
-                    "error": f"paper.jar not found at {self.server_jar.name}",
-                    "result": {}}
-
-        eula_path = self.server_dir / "eula.txt"
-        if eula_path.exists():
-            try:
-                if "eula=true" not in eula_path.read_text().lower():
-                    return {"state": "failed", "error": "EULA not accepted",
-                            "result": {}}
-            except Exception:
-                pass
-
-        cmd = [
-            "java",
-            f"-Xms{self._java_xms}m",
-            f"-Xmx{self._java_xmx}m",
-            "-jar", str(self.server_jar),
-            "nogui",
-        ]
-        try:
-            # Open the log file for child stdout so Paper's own log file
-            # (logs/latest.log) is still produced normally.
-            log_dir = self.server_dir / "logs"
-            log_dir.mkdir(parents=True, exist_ok=True)
-            logf = open(log_dir / "latest.log", "a")
-
-            proc = subprocess.Popen(
-                cmd,
-                cwd=str(self.server_dir),
-                stdin=subprocess.PIPE,
-                stdout=logf,
-                stderr=subprocess.STDOUT,
-                text=True,
-                bufsize=1,
-            )
-            self._console_proc = proc
-        except Exception as e:
-            return {"state": "failed", "error": f"Start failed: {e}",
-                    "result": {}}
-
-        # Verify the process survived the first seconds (failed start detection)
-        deadline = time.time() + min(START_TIMEOUT_SECONDS, 10)
-        while time.time() < deadline:
-            if proc.poll() is not None:
-                return {"state": "failed",
-                        "error": f"Java exited during startup (code {proc.returncode})",
-                        "result": {"exit_code": proc.returncode}}
-            if self.find_paper_pid():
-                break
-            time.sleep(0.5)
-
-        new_pid = self.find_paper_pid()
-        if new_pid is None:
-            # Process alive but pgrep hasn't matched yet — accept if still up
-            if proc.poll() is not None:
-                return {"state": "failed",
-                        "error": "Server process not found after start",
-                        "result": {}}
-            new_pid = proc.pid
-
-        return {"state": "success", "error": None,
-                "result": {"pid": new_pid, "started": True}}
+        """Start the server through the lifecycle manager (idempotent)."""
+        return self.lifecycle.start(reason="dashboard")
 
     def _stop(self) -> Dict[str, Any]:
-        pid = self.find_paper_pid()
-        if pid is None:
-            return {"state": "success", "error": None,
-                    "result": {"already_stopped": True}}
-
-        # 1. Preferred: Minecraft's own `stop` → saves world gracefully.
-        sent = self._write_console("stop")
-        if sent:
-            if self._wait_termination(pid, STOP_TIMEOUT_SECONDS):
-                return {"state": "success", "error": None,
-                        "result": {"method": "console stop", "pid": pid,
-                                   "saved": True}}
-            # fell through to signal path
-
-        # 2. SIGTERM — Paper hooks this and shuts down cleanly (saves world).
-        try:
-            os.kill(pid, signal.SIGTERM)
-        except ProcessLookupError:
-            return {"state": "success", "error": None,
-                    "result": {"note": "process already exited"}}
-        except Exception as e:
-            return {"state": "failed", "error": f"SIGTERM failed: {e}",
-                    "result": {}}
-
-        if self._wait_termination(pid, STOP_TIMEOUT_SECONDS):
-            return {"state": "success", "error": None,
-                    "result": {"method": "SIGTERM", "pid": pid, "saved": True}}
-
-        # 3. Last resort after timeout: SIGKILL. World may lose last seconds;
-        # report honestly rather than claiming a graceful stop.
-        try:
-            os.kill(pid, signal.SIGKILL)
-        except ProcessLookupError:
-            return {"state": "success", "error": None,
-                    "result": {"note": "exited just after timeout"}}
-        if self._wait_termination(pid, 10):
-            return {"state": "success", "error": None,
-                    "result": {"method": "SIGKILL", "pid": pid,
-                               "saved": False,
-                               "warning": "Forced kill — last moments may be unsaved"}}
-        return {"state": "timeout", "error": "Process did not terminate",
-                "result": {"pid": pid}}
+        """Graceful stop through the lifecycle manager."""
+        return self.lifecycle.stop(reason="dashboard")
 
     def _restart(self) -> Dict[str, Any]:
-        # Controlled stop → verify termination → start.
-        stop = self._stop()
-        if stop["state"] != "success":
-            return {"state": "failed",
-                    "error": f"Stop phase failed: {stop.get('error')}",
-                    "result": {"stop": stop}}
-
-        pid = self.find_paper_pid()
-        if pid is not None:
-            if not self._wait_termination(pid, 15):
-                return {"state": "failed",
-                        "error": "Process still alive after stop phase",
-                        "result": {"pid": pid}}
-
-        # Small settle delay so ports free up before restart.
-        time.sleep(2)
-
-        start = self._start()
-        start["result"] = dict(start.get("result") or {}, stop=stop.get("result"))
-        return start
+        """Controlled restart through the lifecycle manager."""
+        return self.lifecycle.restart_once()
 
     def _console(self, command: str) -> Dict[str, Any]:
         ok, err = validate_console_command(command)
@@ -321,10 +211,10 @@ class ActionExecutor:
 
         if not self._write_console(command):
             return {"state": "failed",
-                    "error": "Console channel unavailable — agent did not start "
-                             "this server process (notebook cell owns it). "
-                             "Restart the server from the dashboard to attach "
-                             "the console.",
+                    "error": "Console channel unavailable — the server is not "
+                             "running, or this process did not start it. Start "
+                             "the server from the dashboard (or run the "
+                             "server cell) so the console is attached.",
                     "result": {}}
         return {"state": "success", "error": None,
                 "result": {"command": command, "delivered": True}}
@@ -533,14 +423,6 @@ class ActionExecutor:
 
         return {"state": "failed", "error": "Unhandled player action",
                 "result": {}}
-
-    def _wait_termination(self, pid: int, timeout: int) -> bool:
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            if not self._pid_alive(pid) and self.find_paper_pid() is None:
-                return True
-            time.sleep(1)
-        return False
 
 
 # Singleton

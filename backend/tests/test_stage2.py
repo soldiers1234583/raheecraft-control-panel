@@ -84,19 +84,33 @@ def _call_app(path, method="GET", body=None, cookies=None, headers=None,
     return code, parsed
 
 
+_LOGIN_CACHE = {}
+
+
 def login_cookies():
-    """Configure the admin hash (as main() does) and log in."""
+    """Configure the admin hash (as main() does) and log in.
+
+    The session is cached for the lifetime of the test process. Hundreds of
+    tests each need an admin session, and logging in on every call would
+    trip the login endpoint's rate limit (>100 requests/minute), which is a
+    test-harness artifact rather than a product defect. Re-login happens
+    automatically if the cached session ever becomes invalid.
+    """
     from backend.config import config as cfg
     from backend.auth import hash_secret
     # main() sets this at startup; replicate for tests (setattr: the class
     # attribute only exists once assigned)
     if not getattr(cfg, "ADMIN_PASSWORD_HASH", None):
         cfg.ADMIN_PASSWORD_HASH = hash_secret("test-password-123")
+    cached = _LOGIN_CACHE.get("cookies")
+    if cached and cfg.validate_session(cached["raheecraft_session"]):
+        return dict(cached)
     code, resp = _call_app(
         "/api/auth/login", "POST",
         json.dumps({"username": "admin", "password": "test-password-123"}))
     assert code == 200, resp
     session = resp["session_id"]
+    _LOGIN_CACHE["cookies"] = {"raheecraft_session": session}
     return {"raheecraft_session": session}
 
 
@@ -199,20 +213,24 @@ class TestActionRelay(unittest.TestCase):
         from agent.actions import ActionExecutor
         from unittest.mock import patch as p
         ex = ActionExecutor(server_dir="/nonexistent-server-dir")
-        with p.object(ActionExecutor, "find_paper_pid", return_value=None):
+        # Power actions are executed by the lifecycle manager, which owns the
+        # one authoritative detector; patch it where the implementation reads it.
+        with p("agent.lifecycle.find_paper_pid", return_value=None):
             r = ex.execute({"action_type": "stop_server"})
         self.assertEqual(r["state"], "success")
         self.assertTrue(r["result"]["already_stopped"])
+        self.assertEqual(r["result"]["server_state"], "STOPPED")
 
     def test_start_when_already_running_is_idempotent(self):
         """Agent-side: start with a live process returns success, no dup."""
         from agent.actions import ActionExecutor
         from unittest.mock import patch as p
         ex = ActionExecutor(server_dir="/nonexistent-server-dir")
-        with p.object(ActionExecutor, "find_paper_pid", return_value=999):
+        with p("agent.lifecycle.find_paper_pid", return_value=999):
             r = ex.execute({"action_type": "start_server"})
         self.assertEqual(r["state"], "success")
         self.assertTrue(r["result"]["already_running"])
+        self.assertEqual(r["result"]["pid"], 999)
 
     def test_restart_stops_then_starts(self):
         """Agent-side restart sequence: stop phase verified before start."""
@@ -221,7 +239,7 @@ class TestActionRelay(unittest.TestCase):
         ex = ActionExecutor(server_dir="/nonexistent-server-dir")
         # Nothing running → stop phase idempotent-succeeds, start fails
         # because paper.jar is missing: sequence still ordered correctly.
-        with p.object(ActionExecutor, "find_paper_pid", return_value=None):
+        with p("agent.lifecycle.find_paper_pid", return_value=None):
             r = ex.execute({"action_type": "restart_server"})
         self.assertEqual(r["state"], "failed")
         self.assertIn("paper.jar", r["error"])

@@ -104,6 +104,10 @@ raheecraft-control-panel/
 ├── playit_setup.py      # Playit.gg tunnel (existing)
 ├── geyser_setup.py      # Geyser/Floodgate (existing)
 ├── kaggle_api_setup.py  # Kaggle API helper (existing)
+├── run_backend.py       # Panel entry point (loads .env, starts Bottle)
+├── cloudflare_tunnel.py # Cloudflare connector: token via env, drained output,
+│                        #   reports connected only when Cloudflare says so
+├── run_panel_tunnel.py  # Runs that connector next to a local panel
 ├── minecraft_kaggle_setup.ipynb  # Kaggle notebook (existing)
 ├── KAGGLE_MINECRAFT_GUIDE.md     # User guide (existing)
 ├── KAGGLE_API_README.md          # API docs (existing)
@@ -134,6 +138,43 @@ raheecraft-control-panel/
 | `AGENT_ID` | Agent ID (from backend) |
 | `AGENT_SECRET` | Agent secret (from backend) |
 | `SERVER_DIR` | Same as backend |
+
+## Public Panel URL (Cloudflare Tunnel)
+
+The panel listens on `127.0.0.1:8080`, so the tunnel connector has to run
+*next to it* — in the same Kaggle kernel, or on the same machine as a local
+panel. `cloudflare_tunnel.py` is that connector; `run_panel_tunnel.py` is the
+local entry point.
+
+```bash
+# 1. the panel (reads .env; ADMIN_PASSWORD is required to log in)
+python3 run_backend.py
+
+# 2. the connector for it: token from CLOUDFLARE_TUNNEL_TOKEN or
+#    ~/.cloudflare-tunnel-token (chmod 600), never on a command line
+python3 run_panel_tunnel.py
+
+# report configuration without starting anything
+python3 run_panel_tunnel.py --check
+```
+
+The tunnel itself is remotely managed, so the public hostname lives in
+Cloudflare, not in this repo: a **Public Hostname** rule (`panel.…` →
+`http://localhost:8080`) plus a **proxied CNAME** to `<tunnel-id>.cfargotunnel.com`.
+Create both in the dashboard, or once through the API for an account-owned
+token (`cfat_…`) — see Step 16 of `KAGGLE_MINECRAFT_GUIDE.md`.
+
+On **Android/Termux** the runner adds one thing automatically: `/etc` is a
+read-only symlink to `/system/etc` with no `resolv.conf`, so `cloudflared` (Go)
+falls back to `127.0.0.1:53` and every lookup fails. The runner detects that and
+launches the connector through `proot` with a real `resolv.conf` mounted at
+`/system/etc/resolv.conf` (no root), by setting `CLOUDFLARED_LAUNCHER`. On a
+normal Linux host it sets nothing.
+
+Exposure: `/health` and the login page are public; every `/api/*` route —
+panel and agent alike — returns `401` without a session or agent credential.
+Keep the admin password long, and consider a Cloudflare Access policy for
+`panel.<domain>/api/agent/*`.
 
 ## Deployment
 

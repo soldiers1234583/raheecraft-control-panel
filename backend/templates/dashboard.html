@@ -6,7 +6,10 @@
     <title>RaheeCraft - Dashboard</title>
     <link rel="stylesheet" href="/static/css/main.css">
 </head>
-<body>
+<!-- data-logged-in is the server's answer to "is this session valid?". The
+     browser cannot see the HttpOnly session cookie, so the dashboard must never
+     try to work this out from document.cookie. -->
+<body data-logged-in="{{ '1' if logged_in else '0' }}">
     <!-- Mobile header -->
     <header class="mobile-header">
         <button class="menu-toggle" id="menuToggle" aria-label="Toggle menu">

@@ -1,15 +1,29 @@
 """
 RaheeCraft Server Status
 ========================
-Reads actual server state from the Kaggle filesystem.
+Filesystem/process facts about the *host this backend runs on*.
+
+Scope warning (important)
+-------------------------
+In the deployed topology the backend lives somewhere else (Render) while Paper
+runs inside the Kaggle runtime. Nothing here can therefore observe the real
+server: a `pgrep` on the backend host can only ever answer "is there a
+Minecraft server on THIS box", which is normally no.
+
+The authoritative server state comes from the agent heartbeat
+(`/api/agent/heartbeat` → `AgentHandler`), and `/api/status` labels every field
+with where it came from. These local readings are kept for the same-host case
+(panel + agent in one Kaggle kernel) and are always reported under
+`scope: "backend_host"` so no caller can mistake them for the live server.
 """
 
 import os
+import sys
 import json
 import subprocess
 import time
 from pathlib import Path
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Tuple
 from datetime import datetime
 
 # Server directory (from environment or default)
@@ -70,42 +84,63 @@ class ServerStatus:
             return props["minecraft-version"]
         return os.environ.get("SERVER_VERSION", "1.21.4")
     
-    def is_paper_running(self) -> bool:
-        """Check if Paper server process is running."""
+    def _find_local_paper_pid(self) -> Optional[int]:
+        """PID of a Paper JVM on THIS host, using strict matching.
+
+        The old implementation ran `pgrep -f paper.jar`, which matches any
+        process whose command line merely mentions that string (an editor, a
+        grep, a shell). The canonical detector requires a java process whose
+        argv names this server's jar.
+        """
         try:
-            # Check for java processes with paper.jar
-            result = subprocess.run(
-                ["pgrep", "-f", "paper.jar"],
-                capture_output=True,
-                text=True
-            )
-            return result.returncode == 0 and result.stdout.strip()
-        except Exception:
-            # Alternative: check via ps
-            try:
-                result = subprocess.run(
-                    ["ps", "aux"],
-                    capture_output=True,
-                    text=True
-                )
-                return "paper.jar" in result.stdout
-            except Exception:
-                return False
-    
-    def get_paper_pid(self) -> Optional[int]:
-        """Get Paper server PID if running."""
-        try:
-            result = subprocess.run(
-                ["pgrep", "-f", "paper.jar"],
-                capture_output=True,
-                text=True
-            )
-            if result.returncode == 0 and result.stdout.strip():
-                return int(result.stdout.strip().split("\n")[0])
+            from agent.process_info import find_paper_pid
+            return find_paper_pid(self.server_dir)
         except Exception:
             pass
+
+        # Fallback for a deployment without the agent package installed: scan
+        # /proc argv for a java process that names paper.jar as an argument.
+        try:
+            if not Path("/proc").is_dir():
+                return None
+            for entry in Path("/proc").iterdir():
+                if not entry.name.isdigit():
+                    continue
+                try:
+                    raw = (entry / "cmdline").read_bytes()
+                except OSError:
+                    continue
+                argv = [p.decode("utf-8", "replace")
+                        for p in raw.split(b"\x00") if p]
+                if not argv:
+                    continue
+                if os.path.basename(argv[0]).lower().startswith("java") and \
+                        any(a.endswith("paper.jar") for a in argv[1:]):
+                    return int(entry.name)
+        except Exception:
+            return None
         return None
+
+    def is_paper_running(self) -> bool:
+        """Is a Paper server running on THIS backend host?"""
+        return self._find_local_paper_pid() is not None
+
+    def get_paper_pid(self) -> Optional[int]:
+        """PID of the Paper server on THIS backend host, if any."""
+        return self._find_local_paper_pid()
     
+    def get_log_path(self) -> Path:
+        """Paper's log file on THIS host (`logs/latest.log`, the same file the
+        agent tails). `LOG_FILE` overrides it, mirroring the agent's config.
+
+        Callers use this for the log-history endpoints; the live console is
+        served from the agent's streamed log buffer instead.
+        """
+        override = os.environ.get("LOG_FILE", "").strip()
+        if override:
+            return Path(override)
+        return self.server_dir / "logs" / "latest.log"
+
     def get_world_dir(self) -> Path:
         """Get the world directory path."""
         return self.server_dir / "world"
@@ -155,15 +190,21 @@ class ServerStatus:
         return {"running": False}
     
     def get_server_summary(self) -> Dict[str, Any]:
-        """Get complete server summary."""
-        paper_running = self.is_paper_running()
-        paper_pid = self.get_paper_pid() if paper_running else None
-        
+        """Local (backend-host) facts. Never the authority on the Kaggle server."""
+        paper_pid = self._find_local_paper_pid()
+        paper_running = paper_pid is not None
+
         return {
+            "scope": "backend_host",
+            "server_dir": str(self.server_dir),
             "server_exists": self.server_exists(),
             "paper_jar_exists": self.paper_jar_exists(),
             "eula_accepted": self.eula_accepted(),
+            # Kept for backwards compatibility with the dashboard/API shape;
+            # callers that care about the *live* server must use the agent
+            # heartbeat, which /api/status merges in.
             "paper_running": paper_running,
+            "paper_running_local": paper_running,
             "paper_pid": paper_pid,
             "minecraft_version": self.get_minecraft_version(),
             "paper_version": self.get_paper_version(),

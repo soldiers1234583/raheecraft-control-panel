@@ -62,14 +62,20 @@ python3 kaggle_api_setup.py
 ## 📋 Using the Notebook
 
 1. **Open** the notebook on Kaggle
-2. **Run Cell 1** — Environment check (confirms Java, RAM, internet)
-3. **Edit Cell 2** — Configure settings (edition, players, seed)
-4. **Run Cell 3** — Download Paper server
-5. **Run Cell 4** — Generate config files
-6. **Run Cell 5** — Start the server
-7. **Run Cell 6** — Set up ngrok tunnel
-8. **Run Cell 7** — View connection info
-9. **Run Cell 8** — Backup world before closing
+2. **Run Cell 1** — Environment check (confirms Java 21, RAM, internet)
+3. **Edit Cell 2** — Configure settings (players, view distance)
+4. **Run Cell 3** — Google Drive authentication (for backups)
+5. **Run Cell 4** — Drive connection test
+6. **Run Cell 5** — World restoration (existing world is never overwritten)
+7. **Run Cell 6** — Download and **verify** the Paper JAR
+8. **Run Cell 7** — Generate config files (`eula.txt`, `server.properties`)
+9. **Run Cell 8** — Start the control agent (this is what the dashboard talks to)
+10. **Run Cell 9** — Start the server and wait for real readiness
+11. **Run Cell 10** — Set up the Playit.gg tunnel
+12. **Run Cell 11** — View connection info
+13. **Run Cell 12** — Backup operations
+14. **Run Cell 13** — Logs, troubleshooting, shutdown
+15. **Run Cell 14** — Run the web panel in the kernel
 
 ---
 
@@ -106,14 +112,15 @@ kaggle datasets download -d username/dataset-name
 
 ### Kaggle Session Limits
 - **9-hour max** per session
-- World data **lost** when session ends
-- **No inbound connections** — must use ngrok
+- World data **lost** when session ends — Drive backups are how you keep it
+- **No inbound connections** — players connect through Playit.gg
 
-### ngrok Setup (Required for Friends to Connect)
-1. Sign up at https://ngrok.com
-2. Get auth token from dashboard
-3. Paste token in Notebook Cell 6
-4. Run Cell 6 to create tunnel
+### Playit.gg Setup (Required for Friends to Connect)
+1. Sign up at https://playit.gg
+2. Copy your account token from the dashboard
+3. Add `PLAYIT_TOKEN` to Kaggle Secrets
+4. Run Cell 10 to start the connector and print the public address
+5. Confirm in the Playit dashboard that the tunnel targets `127.0.0.1:25565`
 
 ### World Backup
 Before closing the notebook:

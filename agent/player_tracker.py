@@ -81,6 +81,9 @@ class PlayerTracker:
         self._lock = threading.Lock()
         # name -> {"joined_at": float|None, "uuid": str|None}
         self._online: Dict[str, Dict[str, Any]] = {}
+        # Whether any join/leave/list line has been observed this run. Lets a
+        # caller tell "nobody online" apart from "nothing observed yet".
+        self._seen_event = False
 
     # --- log observation (called from the log streamer) ----------------------
 
@@ -90,6 +93,7 @@ class PlayerTracker:
         if m:
             name = m.group("name")
             with self._lock:
+                self._seen_event = True
                 entry = self._online.setdefault(
                     name, {"joined_at": None, "uuid": None})
                 entry["joined_at"] = time.time()
@@ -99,6 +103,7 @@ class PlayerTracker:
         m = LEAVE_RE.match(line)
         if m:
             with self._lock:
+                self._seen_event = True
                 self._online.pop(m.group("name"), None)
             return
         # Reconcile from `list` output when available
@@ -108,6 +113,7 @@ class PlayerTracker:
                 names = [n.strip() for n in m.group("names").split(",")
                          if valid_username(n.strip())]
                 with self._lock:
+                    self._seen_event = True
                     seen = set(self._online)
                     for name in names:
                         if name not in seen:
@@ -122,6 +128,15 @@ class PlayerTracker:
     def observe_lines(self, lines: List[str]) -> None:
         for line in lines:
             self.observe_line(line)
+
+    def has_observations(self) -> bool:
+        """True once a join/leave/list line has been seen this run.
+
+        Lets a caller tell "nobody is online" apart from "nothing observed
+        yet", so it can report None instead of a fabricated 0.
+        """
+        with self._lock:
+            return self._seen_event
 
     # --- Paper structured file readers ---------------------------------------
 

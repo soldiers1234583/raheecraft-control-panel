@@ -20,7 +20,9 @@
                 <p>Server Control Panel</p>
             </div>
             
-            <form id="login-form" class="auth-form">
+            <!-- method="post": the fallback path must never send the password
+                 in a URL. The script below intercepts submit and uses the API. -->
+            <form id="login-form" class="auth-form" method="post" action="/login">
                 <div class="form-group">
                     <label for="username">Username</label>
                     <input type="text" id="username" name="username" required autocomplete="username">
@@ -46,5 +48,39 @@
     </div>
     
     <script src="/static/js/auth.js"></script>
+    <script>
+    (function () {
+        const form = document.getElementById('login-form');
+        const errorBox = document.getElementById('error-message');
+        const button = form.querySelector('button[type="submit"]');
+
+        function showError(message) {
+            errorBox.textContent = message;
+            errorBox.style.display = 'block';
+        }
+
+        // A failed server-side (no-JavaScript) login redirects here with
+        // error=1 — say so instead of leaving a blank form.
+        const reason = new URLSearchParams(window.location.search).get('error');
+        if (reason === '1') showError('Invalid username or password');
+        else if (reason === 'ratelimited') showError('Too many attempts. Wait a minute and try again.');
+        else if (reason) showError('Sign-in failed. Try again.');
+
+        form.addEventListener('submit', async function (event) {
+            event.preventDefault();
+            errorBox.style.display = 'none';
+            button.disabled = true;
+            const result = await Auth.login(
+                document.getElementById('username').value,
+                document.getElementById('password').value);
+            button.disabled = false;
+            if (result.success) {
+                window.location.href = '/';
+                return;
+            }
+            showError(result.error || 'Login failed');
+        });
+    })();
+    </script>
 </body>
 </html>

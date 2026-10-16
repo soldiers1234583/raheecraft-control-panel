@@ -24,11 +24,13 @@ Reference:
 """
 
 import os
+import re
 import sys
 import json
 import time
 import subprocess
 import tempfile
+import threading
 import shutil
 import hashlib
 from pathlib import Path
@@ -46,6 +48,121 @@ PLAYIT_TOKEN_VAR = "PLAYIT_TOKEN"  # Account token for claiming
 
 # Where to store token (Kaggle working, persists during session)
 TOKEN_FILE = os.path.join(PLAYIT_DIR, ".playit_token")
+
+# The public host:port the connector was last given. Written here by whichever
+# process runs the connector (the notebook cell) and read by the agent, which
+# answers the panel's heartbeats from a different thread and its own
+# PlayitTunnel instance. Without this file the panel can only ever show
+# "address unknown".
+ADDRESS_FILE = os.path.join(PLAYIT_DIR, "public_address.json")
+
+# The connector's own stdout is appended here (see `_start_output_drain`). It is
+# the fallback source for the address: it survives a re-run of the notebook cell
+# and is the only place the address exists when the instance that started the
+# connector is not the one now asking for it.
+PLAYIT_LOG = os.path.join(PLAYIT_DIR, "playit.log")
+
+# Hostnames Playit issues tunnel addresses under: `name.playit.gg` and the very
+# common `name.<region>.at.ply.gg` / `name.tun.ply.gg`. Custom domains (offered
+# on some plans) are deliberately not matched: any-host matching would report
+# unrelated hostnames from the connector's output as the join address.
+PLAYIT_ADDRESS_PATTERN = (r'([a-z0-9][a-z0-9.-]*\.'
+                          r'(?:playit\.gg|ply\.gg)):(\d{1,5})')
+
+# How much of the log tail to scan. The connector is low volume, so this covers
+# a whole session in practice.
+_LOG_SCAN_BYTES = 64 * 1024
+
+
+def clear_public_address() -> None:
+    """Start a fresh address record for a new connector.
+
+    Removes the previous address and rotates the connector log, so the log
+    fallback cannot recover a stale address from the connector that just went
+    away. The old log is kept as ``playit.log.prev`` for diagnostics.
+    """
+    try:
+        os.remove(ADDRESS_FILE)
+    except OSError:
+        pass
+    try:
+        if os.path.exists(PLAYIT_LOG):
+            os.replace(PLAYIT_LOG, PLAYIT_LOG + ".prev")
+    except OSError:
+        pass
+
+
+def _write_public_address(hostname: str, port: str) -> None:
+    """Persist the connector's real public address for the agent to read.
+
+    Written atomically (temp file + rename) so a concurrent reader never sees a
+    half-written file. Never called with a guessed address: callers pass what
+    the connector actually printed.
+    """
+    try:
+        os.makedirs(PLAYIT_DIR, exist_ok=True)
+        payload = {"hostname": hostname, "port": port,
+                   "address": f"{hostname}:{port}"}
+        tmp = f"{ADDRESS_FILE}.{os.getpid()}.{threading.get_ident()}.tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh)
+        os.replace(tmp, ADDRESS_FILE)
+    except OSError:
+        pass
+
+
+def _read_recorded_address() -> Optional[str]:
+    """The address written to ADDRESS_FILE, when one is there and well formed."""
+    try:
+        with open(ADDRESS_FILE, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    address = data.get("address")
+    if isinstance(address, str) and address.count(":") == 1 and address:
+        return address
+    hostname, port = data.get("hostname"), data.get("port")
+    if hostname and port:
+        return f"{hostname}:{port}"
+    return None
+
+
+def _scan_log_for_address() -> Optional[str]:
+    """The last real Playit address in the connector's drained output, or None.
+
+    Used when the address file is missing — the notebook cell was re-run without
+    starting a new connector, or another instance started it. Only Playit
+    hostnames are accepted, so the connector's other output cannot turn into a
+    wrong join address. The log is rotated by ``clear_public_address`` whenever a
+    new connector starts, so a stale address from a previous connector is never
+    returned.
+    """
+    try:
+        size = os.path.getsize(PLAYIT_LOG)
+        with open(PLAYIT_LOG, "rb") as fh:
+            fh.seek(max(0, size - _LOG_SCAN_BYTES))
+            text = fh.read().decode("utf-8", "replace")
+    except OSError:
+        return None
+    matches = re.findall(PLAYIT_ADDRESS_PATTERN, text, re.IGNORECASE)
+    if not matches:
+        return None
+    hostname, port = matches[-1]
+    return f"{hostname}:{port}"
+
+
+def read_public_address() -> Optional[str]:
+    """The public address the connector last reported, as "host:port", or None.
+
+    File first (fast, written the moment the address is seen), then the
+    connector log, so a re-run of the notebook cell still reports the same real
+    address. Returns None — never a placeholder — when no real address has been
+    reported, so the panel keeps saying "address unknown" instead of showing a
+    wrong one.
+    """
+    return _read_recorded_address() or _scan_log_for_address()
 
 
 class PlayitError(Exception):
@@ -67,7 +184,24 @@ class PlayitTunnel:
         self.process = None
         self.token = None
         self.public_address = None  # (hostname, port) tuple
+        # Bounded buffer of connector output, filled by a drain thread. The
+        # agent's stdout pipe must be drained continuously: an unread PIPE fills
+        # its OS buffer and freezes the connector, and a blocking readline()
+        # with no output hangs the notebook cell indefinitely.
+        self._output_lines = []
         
+    def _redact(self, line: str) -> str:
+        """Remove the tunnel token from connector output before print/log.
+
+        The connector's stdout is forwarded (printed and appended to
+        playit.log); if it ever echoes the account token, the token must not
+        escape into a notebook cell's output or a log file.
+        """
+        for value in (self.token, os.environ.get(PLAYIT_TOKEN_VAR, "").strip()):
+            if value and len(value) >= 8 and value in line:
+                line = line.replace(value, "***")
+        return line
+
     def _get_token(self) -> Optional[str]:
         """Get Playit token from Kaggle Secrets or stored file."""
         # Check environment (Kaggle Secrets)
@@ -256,7 +390,11 @@ class PlayitTunnel:
         
         # Make sure binary is executable
         os.chmod(binary_path, 0o755)
-        
+
+        # A new connector gets a new public address. Drop the previous one first
+        # so the panel never shows last session's address.
+        clear_public_address()
+
         # Prepare command
         # Playit agent typically runs with a config directory
         cmd = [
@@ -265,10 +403,11 @@ class PlayitTunnel:
             "--no-auto-update",  # Don't auto-update in Kaggle
         ]
         
-        # Add token if available
+        # Add token if available. It is passed through the environment, never
+        # as a command-line argument, so it cannot be read from `ps`.
         token = self._get_token()
         if token:
-            # Some agents accept token via env or flag
+            self.token = token
             env = os.environ.copy()
             env["PLAYIT_TOKEN"] = token
         else:
@@ -292,7 +431,11 @@ class PlayitTunnel:
             print(f"✅ Agent started (PID: {self.process.pid})")
             print("\n⏳ Waiting for agent to initialize...")
             print("   (This may take 30-60 seconds)")
-            
+
+            # Start draining stdout into a bounded buffer + log file *before*
+            # reading, so the connector can never block on a full pipe.
+            self._start_output_drain()
+
             # Read initial output to find claim code or errors
             self._read_initial_output()
             
@@ -302,72 +445,127 @@ class PlayitTunnel:
             print(f"❌ Failed to start agent: {e}")
             return False
     
+    def _start_output_drain(self):
+        """Continuously drain the connector's stdout into a buffer + log file."""
+        import threading
+
+        if self.process is None or self.process.stdout is None:
+            return
+
+        try:
+            log_path = Path(PLAYIT_LOG)
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            log_path = None
+
+        stream = self.process.stdout
+        lines = self._output_lines
+
+        def _drain():
+            try:
+                for raw in iter(stream.readline, b""):
+                    if not raw:
+                        break
+                    line = raw.decode("utf-8", errors="ignore").rstrip("\r\n")
+                    line = self._redact(line)
+                    lines.append(line)
+                    # Persist the address the moment the connector prints it, not
+                    # only inside the initial 60s window: a later assignment must
+                    # still reach the panel.
+                    address = self._extract_address(line)
+                    if address and address != self.public_address:
+                        self._remember_address(address)
+                    if len(lines) > 4000:
+                        del lines[:2000]
+                    if log_path is not None:
+                        try:
+                            with open(log_path, "a") as fh:
+                                fh.write(line + "\n")
+                        except OSError:
+                            pass
+            except Exception:
+                pass
+
+        threading.Thread(target=_drain, name="playit-output", daemon=True).start()
+
     def _read_initial_output(self, timeout: int = 60):
-        """Read initial agent output to find status/claim code."""
+        """Watch the connector's output (bounded) for status, claim code, errors."""
         if not self.process:
             return
-        
-        start_time = time.time()
-        output_lines = []
-        
-        print("\n📋 Agent output (first 30 seconds):")
+
+        print("\n📋 Agent output (watching for up to %ds):" % timeout)
         print("-" * 40)
-        
-        while time.time() - start_time < timeout:
-            try:
-                line = self.process.stdout.readline().decode('utf-8', errors='ignore')
-                if not line:
-                    break
-                
-                output_lines.append(line.strip())
-                
-                # Print relevant lines
+
+        deadline = time.time() + timeout
+        seen = 0
+        while time.time() < deadline:
+            lines = list(self._output_lines)
+            ready = False
+            for line in lines[seen:]:
+                line = self._redact(line)
                 line_lower = line.lower()
-                if any(k in line_lower for k in ['claim', 'code', 'token', 'error', 'fail', 
-                                                   'ready', 'connect', 'address', 'hostname',
-                                                   'port', 'http', 'tcp', 'udp']):
+                if any(k in line_lower for k in ['claim', 'code', 'token', 'error', 'fail',
+                                                 'ready', 'connect', 'address', 'hostname',
+                                                 'port', 'http', 'tcp', 'udp']):
                     print(f"   {line.strip()[:100]}")
-                
-                # Check for ready state
                 if 'ready' in line_lower or 'listening' in line_lower:
                     print("\n✅ Agent appears to be ready")
+                    ready = True
                     break
-                    
-            except Exception:
+            seen = len(lines)
+            if ready:
                 break
-        
+            if self.process.poll() is not None:
+                break
+            time.sleep(0.5)
+
         print("-" * 40)
-        
+
         # Parse for public address
-        self._parse_public_address(output_lines)
-    
+        self._parse_public_address(list(self._output_lines))
+
+    # See PLAYIT_ADDRESS_PATTERN: Playit's own domains only, and the port is
+    # part of the match — a bare hostname is not something a player can use.
+    ADDRESS_PATTERN = PLAYIT_ADDRESS_PATTERN
+
+    def _extract_address(self, line: str) -> Optional[Tuple[str, str]]:
+        """The public host:port in one connector output line, or None.
+
+        A port is REQUIRED. A missing port must never be filled in with a
+        guess, because that sends players to an address nobody is listening on.
+        """
+        match = re.search(self.ADDRESS_PATTERN, line, re.IGNORECASE)
+        if not match:
+            return None
+        return match.group(1), match.group(2)
+
+    def _remember_address(self, address: Tuple[str, str]) -> None:
+        """Record a real address in memory *and* in the shared file.
+
+        The file is how the agent learns the address: the notebook starts the
+        connector, but the agent answers the panel's heartbeats from a separate
+        thread and its own PlayitTunnel instance, so an in-memory value here
+        never reached the panel before.
+        """
+        self.public_address = address
+        _write_public_address(address[0], address[1])
+
     def _parse_public_address(self, output_lines: list):
-        """Try to extract public hostname/port from agent output."""
-        # Common patterns in Playit output
-        patterns = [
-            r'([a-z0-9-]+\.playit\.gg):\d+',
-            r'address:\s*([a-z0-9.-]+):\d+',
-            r'public\s*([a-z0-9.-]+):\d+',
-        ]
-        
-        import re
-        
+        """Find and persist the first real address the connector printed.
+
+        A port is REQUIRED; if no real address is observed we report nothing
+        and point at the dashboard instead of inventing one.
+        """
         for line in output_lines:
-            for pattern in patterns:
-                match = re.search(pattern, line, re.IGNORECASE)
-                if match:
-                    hostname = match.group(1)
-                    # Find port near hostname
-                    port_match = re.search(r':(\d+)', line)
-                    port = port_match.group(1) if port_match else "25565"
-                    
-                    self.public_address = (hostname, port)
-                    print(f"\n📍 Found address: {hostname}:{port}")
-                    return
-        
-        # If not found in output, user needs to check dashboard
+            address = self._extract_address(line)
+            if address:
+                self._remember_address(address)
+                print(f"\n📍 Found address: {address[0]}:{address[1]}")
+                return
+
+        # Not found in output - the user has to read the dashboard.
         if not self.public_address:
-            print("\n⚠️  Public address not found in output")
+            print("\n⚠️  Public address not found in the connector output")
             print("   Check https://playit.gg/dashboard for your address")
     
     def get_public_address(self) -> Optional[Tuple[str, str]]:
@@ -380,7 +578,15 @@ class PlayitTunnel:
         # Try to get from agent output first
         if self.public_address:
             return self.public_address
-        
+
+        # Then the shared file: another process (the notebook cell) may be the
+        # one that started the connector and parsed the address.
+        persisted = read_public_address()
+        if persisted:
+            hostname, _, port = persisted.partition(":")
+            self.public_address = (hostname, port)
+            return self.public_address
+
         # Check if agent is still running
         if self.process and self.process.poll() is None:
             print("\n⚠️  Agent running but address not detected")
@@ -392,12 +598,12 @@ class PlayitTunnel:
         return None
     
     def _read_exit_output(self):
-        """Read any remaining output after agent exits."""
+        """Show the tail of the connector output after it exits."""
         if not self.process:
             return
-        
+
         print("\n📋 Agent exit output:")
-        for line in self.process.stdout.read().decode('utf-8', errors='ignore').split('\n')[-20:]:
+        for line in self._output_lines[-20:]:
             if line.strip():
                 print(f"   {line.strip()[:100]}")
     
