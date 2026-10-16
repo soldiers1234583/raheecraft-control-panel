@@ -18,6 +18,15 @@ credentials.json
 *.secret
 *.env.example
 
+# Kaggle credentials and the local helpers that hold them: kept on disk, never
+# committed. Anything here that was ever committed must be rotated, not just
+# deleted, because it stays in git history.
+.kaggle/
+kaggle.json
+access_token
+kaggle_api_setup.py
+KAGGLE_API_README.md
+
 # IDE
 .agents/
 .claude/

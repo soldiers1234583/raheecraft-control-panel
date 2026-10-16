@@ -409,8 +409,10 @@ class TestRedactText(unittest.TestCase):
         self.assertNotIn("hunter22", out)
 
     def test_redacts_kaggle_token(self):
-        out = redact_text("auth KGAT_533e3a3edd4ecdb4366439b479b8d374 done")
-        self.assertNotIn("533e3a3edd4ecdb4366439b479b8d374", out)
+        # A synthetic token: the test only checks that a `KGAT_...` string is
+        # redacted, and a real one must never live in the repository.
+        out = redact_text("auth KGAT_0123456789abcdef0123456789abcdef done")
+        self.assertNotIn("0123456789abcdef0123456789abcdef", out)
 
     def test_redacts_long_hex(self):
         out = redact_text("key a8ee6c52b0aae85c1e5c2e1a3d4d5e6f7a8b9c0d")

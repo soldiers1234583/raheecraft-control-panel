@@ -103,14 +103,14 @@ raheecraft-control-panel/
 ├── drive_backup.py      # Google Drive backup (existing)
 ├── playit_setup.py      # Playit.gg tunnel (existing)
 ├── geyser_setup.py      # Geyser/Floodgate (existing)
-├── kaggle_api_setup.py  # Kaggle API helper (existing)
+├── kaggle_api_setup.py  # Kaggle API helper (local only; gitignored)
 ├── run_backend.py       # Panel entry point (loads .env, starts Bottle)
 ├── cloudflare_tunnel.py # Cloudflare connector: token via env, drained output,
 │                        #   reports connected only when Cloudflare says so
 ├── run_panel_tunnel.py  # Runs that connector next to a local panel
 ├── minecraft_kaggle_setup.ipynb  # Kaggle notebook (existing)
 ├── KAGGLE_MINECRAFT_GUIDE.md     # User guide (existing)
-├── KAGGLE_API_README.md          # API docs (existing)
+├── KAGGLE_API_README.md          # API docs (local only; gitignored)
 ├── .env.example         # Environment template
 ├── .gitignore           # Git ignore rules
 └── README.md            # This file
