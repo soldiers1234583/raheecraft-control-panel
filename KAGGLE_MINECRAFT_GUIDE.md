@@ -156,16 +156,20 @@ Kaggle has no public IP, so friends connect through Playit.gg.
 claim in the Playit dashboard. The agent does not — and cannot — set that
 mapping for you, so check it once in the dashboard.
 
-Playit hands out either a `*.playit.gg` name or one of its short names such as
-`name.<region>.at.ply.gg`; both are recognized. The address the connector was
-**actually given** is written to `/kaggle/working/playit/public_address.json` as
-it appears, and the dashboard's **Playit.gg Tunnel** card reads it back through
-the agent — so the panel shows the real join address, or "address unknown",
-never a guessed one.
+Playit hands out a `*.playit.gg` name, one of its short names such as
+`name.<region>.at.ply.gg`, or — with "Show IPs instead of domains" on — a public
+IP. All are recognized when the connector labels the line as the address (a
+bare IP on an unlabeled line is ignored, so a tunnel-server IP is never
+offered as a join address). The address the connector was **actually given** is
+written to `/kaggle/working/playit/public_address.json` as it appears, and the
+dashboard's **Playit.gg Tunnel** card reads it back through the agent — so the
+panel shows the real join address, or "address unknown", never a guessed one.
 
-⚠️ Keep **"Show IPs instead of domains"** OFF in your Playit account settings.
-With it on, Playit reports a bare IP that the panel deliberately does not trust
-as a join address, and the card stays "address unknown".
+If the card still reads **"address unknown"** (some connector builds never
+print the address), set it explicitly: copy the address from
+https://playit.gg/dashboard and add a Kaggle Secret `PLAYIT_PUBLIC_ADDRESS`
+(or env var) equal to `name.playit.gg:PORT`. It is validated — a loopback or
+private address is refused — and takes precedence over anything parsed.
 
 ### Step 13: Run Cell 11 — Connection Info & Health Check
 
@@ -514,16 +518,19 @@ If running Bedrock via tunnel:
   `usercache.json`. These make the server *remember* who is an operator and who
   is banned across sessions; without them a player keeps their items but loses
   op, and a banned player is unbanned, on every new session.
+- The `plugins/` tree: plugin JARs **and** the data that belongs to them
+  (config files, a LuckPerms permissions database, …). Plugins are uploaded by
+  hand (panel upload, or the Geyser jars), so without this a new session comes
+  back with no plugins and no permissions. Transient files (`*.log`, `*.tmp`,
+  caches) are skipped; JARs are stored as-is, so a large `plugins/` folder makes
+  every backup larger — keep plugins lean on the free tier.
 - Excludes logs, caches, temp files
 - Creates timestamped ZIP archives
 - Stored in Drive folder: **Minecraft-Server-Backups**
 - Keeps last 5 backups (configurable via `MAX_BACKUPS_TO_KEEP`)
 
-**Not included, on purpose:** `plugins/` and `server.properties`. The notebook
-re-writes `server.properties` (Cell 7) and reinstalls plugins each session, so a
-restored copy would just be overwritten; plugin *data* (e.g. a LuckPerms
-permission database) is therefore not persisted — keep such state inside the
-world or avoid plugins on the free tier.
+**Not included, on purpose:** `server.properties`. The notebook re-writes it
+(Cell 7) on every start, so a restored copy would be overwritten immediately.
 
 **Timing:** backups run every `BACKUP_INTERVAL_MINUTES` (30 by default) and
 only when something actually changed. A session that dies abruptly loses
@@ -549,11 +556,12 @@ before you stop for the day.
 | **Server won't start** | Check EULA is accepted (`eula=true` in eula.txt) |
 | **Out of memory** | Reduce `JAVA_XMX` to 1024 or 512 |
 | **Can't connect from outside** | Verify Playit.gg tunnel is running, check the address |
-| **Panel says "Connected, address unknown"** | The connector has not been given an address yet, or **"Show IPs instead of domains"** is ON. Check `tail /kaggle/working/playit/playit.log`; the address is cached in `/kaggle/working/playit/public_address.json` |
+| **Panel says "Connected, address unknown"** | The connector has not been given an address yet, or its output does not contain one. Check `tail /kaggle/working/playit/playit.log`; the address is cached in `/kaggle/working/playit/public_address.json`. If it is genuinely not printed, set `PLAYIT_PUBLIC_ADDRESS=name.playit.gg:PORT` from the Playit dashboard |
 | **Lag with multiple players** | Reduce `VIEW_DISTANCE` to 4, reduce player count |
 | **World not saving** | Always run `stop` command in-game, don't just kill process |
 | **Players spawn with nothing / lose items next session** | The world holds player data (`world/playerdata/`); it is uploaded on each backup. If the session died before the next `BACKUP_INTERVAL_MINUTES` upload, recent progress is gone — back up manually (Cell 12) before ending a session |
 | **Ops / whitelist / bans reset every session** | Fixed: these live in the server root and are now included in the backup. If they still reset, the backup predates this fix — take a fresh backup (Cell 12) |
+| **Plugins or permissions gone next session** | Fixed: `plugins/` (jars + data) is now part of the backup. If it is still empty, the last backup predates this change — re-upload the plugins, then take a fresh backup (Cell 12) |
 
 ---
 

@@ -51,6 +51,12 @@ SERVER_STATE_FILES = (
     "usercache.json",
 )
 
+# Directories outside the world folders that carry persistent server state.
+# `plugins/` holds plugin JARs and the data that belongs to them (config files,
+# a LuckPerms permissions database, …). Without it a new session comes back with
+# no plugins and no permissions, even though the world itself is intact.
+SERVER_EXTRA_DIRS = ("plugins",)
+
 # Google Drive OAuth scopes (least-privileged for file access)
 DRIVE_SCOPES = [
     "https://www.googleapis.com/auth/drive.file",
@@ -531,6 +537,11 @@ class GoogleDriveBackup:
                    if os.path.isfile(os.path.join(SERVER_DIR, n))]
         if present:
             print(f"   Would include player state: {', '.join(present)}")
+        for dir_name in SERVER_EXTRA_DIRS:
+            tree = os.path.join(SERVER_DIR, dir_name)
+            if os.path.isdir(tree):
+                size = self._get_dir_size(tree)
+                print(f"   Would include {dir_name}/: {size / (1024*1024):.1f} MB")
         print("   Would upload to: " + BACKUP_FOLDER_NAME)
     
     def _get_dir_size(self, path: str) -> int:
@@ -556,7 +567,7 @@ class GoogleDriveBackup:
                         file_path = os.path.join(root, file)
                         
                         # Skip log/cache files
-                        if any(skip in file_path for skip in ['.log', '.tmp', '.cache']):
+                        if self._is_transient(file_path):
                             continue
                         
                         # Calculate archive name
@@ -575,6 +586,38 @@ class GoogleDriveBackup:
                 if os.path.isfile(path):
                     print(f"   Adding {name}...")
                     zf.write(path, name)
+
+            # Whole directories the world-only walk never reaches (plugins/: the
+            # JARs plus the data they keep next to them).
+            for dir_name in SERVER_EXTRA_DIRS:
+                self._add_tree_to_zip(zf, dir_name,
+                                      os.path.join(SERVER_DIR, dir_name))
+
+    @staticmethod
+    def _is_transient(file_path: str) -> bool:
+        """Files never worth archiving: logs, temp files and caches."""
+        return any(skip in file_path for skip in ('.log', '.tmp', '.cache'))
+
+    def _add_tree_to_zip(self, zf, top_name: str, tree_path: str) -> None:
+        """Archive a whole directory under its own name, safely.
+
+        Skips the same transient files as the worlds and keeps every member
+        inside `top_name/`, so a crafted archive can never restore outside the
+        server directory. A missing directory is simply not an error.
+        """
+        if not os.path.isdir(tree_path):
+            return
+        print(f"   Adding {top_name}/...")
+        for root, dirs, files in os.walk(tree_path):
+            dirs[:] = [d for d in dirs if d not in ('.git', '__pycache__')]
+            for file in files:
+                file_path = os.path.join(root, file)
+                if self._is_transient(file_path):
+                    continue
+                arcname = os.path.relpath(file_path, SERVER_DIR)
+                if arcname != top_name and not arcname.startswith(top_name + os.sep):
+                    continue
+                zf.write(file_path, arcname)
     
     def _get_latest_backup(self) -> Optional[dict]:
         """Get metadata for the most recent backup."""
@@ -642,6 +685,17 @@ class GoogleDriveBackup:
         for name in SERVER_STATE_FILES:
             if newer_than_backup(os.path.join(SERVER_DIR, name)):
                 return False
+
+        # A change under plugins/ (new jar, edited config, updated permissions)
+        # must also trigger a backup.
+        for dir_name in SERVER_EXTRA_DIRS:
+            tree = os.path.join(SERVER_DIR, dir_name)
+            if not os.path.isdir(tree):
+                continue
+            for dirpath, dirnames, filenames in os.walk(tree):
+                for f in filenames:
+                    if newer_than_backup(os.path.join(dirpath, f)):
+                        return False
         return True
     
     def _cleanup_old_backups(self, folder_id: str):

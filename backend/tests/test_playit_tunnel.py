@@ -131,6 +131,29 @@ class TestPublicAddressIsNeverInvented(_SharedAddressFile):
     def test_get_public_address_returns_none_before_assignment(self):
         self.assertIsNone(self.tunnel.get_public_address())
 
+    def test_labeled_public_ip_is_accepted(self):
+        """Playit's "show IPs instead of domains" mode prints a bare IP."""
+        self.tunnel._parse_public_address(["tunnel address: 203.0.113.10:25565"])
+        self.assertEqual(self.tunnel.public_address, ("203.0.113.10", "25565"))
+
+    def test_labeled_custom_domain_is_accepted(self):
+        self.tunnel._parse_public_address(["join address: mc.example.com:25565"])
+        self.assertEqual(self.tunnel.public_address, ("mc.example.com", "25565"))
+
+    def test_unlabeled_ip_is_not_an_address(self):
+        """A tunnel-server IP must never be shown as the join address."""
+        self.tunnel._parse_public_address(
+            ["connected to tunnel server 203.0.113.9:4443"])
+        self.assertIsNone(self.tunnel.public_address)
+
+    def test_the_local_target_is_never_an_address(self):
+        self.tunnel._parse_public_address(["local address: 127.0.0.1:25565"])
+        self.assertIsNone(self.tunnel.public_address)
+
+    def test_a_private_ip_is_not_an_address(self):
+        self.tunnel._parse_public_address(["tunnel address: 192.168.1.5:25565"])
+        self.assertIsNone(self.tunnel.public_address)
+
     def test_ply_gg_addresses_are_recognized(self):
         """Playit's common short domain must not read as 'unknown'.
 
@@ -239,6 +262,36 @@ class TestAgentReportsTheTunnelAddress(_SharedAddressFile):
     def test_stopped_connector_never_reports_an_address(self):
         playit_setup._write_public_address("rahee.playit.gg", "12345")
         self.assertEqual(self._check(None), (False, None))
+
+
+class TestExplicitAddressOverride(_SharedAddressFile):
+    """PLAYIT_PUBLIC_ADDRESS is the escape hatch when output cannot be parsed."""
+
+    def test_a_valid_override_is_reported(self):
+        with patch.dict(os.environ,
+                        {"PLAYIT_PUBLIC_ADDRESS": "rahee.gl.at.ply.gg:25565"}):
+            self.assertEqual(read_public_address(), "rahee.gl.at.ply.gg:25565")
+
+    def test_the_override_wins_over_a_recorded_address(self):
+        playit_setup._write_public_address("old.playit.gg", "11111")
+        with patch.dict(os.environ,
+                        {"PLAYIT_PUBLIC_ADDRESS": "new.playit.gg:22222"}):
+            self.assertEqual(read_public_address(), "new.playit.gg:22222")
+
+    def test_an_invalid_override_is_ignored(self):
+        for bad in ("", "not-an-address", "127.0.0.1:25565", "192.168.0.1:1",
+                    "hostonly", "1.2.3.4"):
+            with patch.dict(os.environ, {"PLAYIT_PUBLIC_ADDRESS": bad}):
+                self.assertIsNone(read_public_address(), bad)
+
+    def test_the_override_is_reported_to_the_panel(self):
+        from agent import process_info
+        from agent import status as agent_status
+        with patch.dict(os.environ,
+                        {"PLAYIT_PUBLIC_ADDRESS": "rahee.gl.at.ply.gg:25565"}), \
+                patch.object(process_info, "find_playit_pid", lambda: 4321):
+            self.assertEqual(agent_status.check_playit_tunnel(),
+                             (True, "rahee.gl.at.ply.gg:25565"))
 
 
 if __name__ == "__main__":

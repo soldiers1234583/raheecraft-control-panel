@@ -73,6 +73,62 @@ PLAYIT_ADDRESS_PATTERN = (r'([a-z0-9][a-z0-9.-]*\.'
 # a whole session in practice.
 _LOG_SCAN_BYTES = 64 * 1024
 
+# Optional explicit override of the public address, e.g. "rahee.gl.at.ply.gg:25565".
+# Set it when the connector's output cannot be parsed (Playit's own dashboard
+# always shows the address). Read from the environment / Kaggle Secrets; it is
+# never written to disk and always wins over a parsed value.
+PLAYIT_ADDRESS_VAR = "PLAYIT_PUBLIC_ADDRESS"
+
+# A non-Playit host:port is only trusted when the line names it as the address.
+# This keeps the connector's other output (a tunnel-server IP, the local
+# 127.0.0.1 target) from ever being reported as the join address.
+_ADDRESS_LABELS = ("address", "public", "hostname", "join")
+_IPV4_RE = re.compile(r'^\d{1,3}(?:\.\d{1,3}){3}$')
+_HOST_PORT_RE = re.compile(r'([A-Za-z0-9][A-Za-z0-9.-]*):(\d{1,5})')
+
+
+def _is_public_ipv4(host: str) -> bool:
+    """True for a routable IPv4 address (never loopback or a private range)."""
+    parts = host.split(".")
+    if len(parts) != 4:
+        return False
+    try:
+        nums = [int(p) for p in parts]
+    except ValueError:
+        return False
+    if any(n > 255 for n in nums):
+        return False
+    a, b = nums[0], nums[1]
+    if a in (0, 10, 127):
+        return False
+    if a == 172 and 16 <= b <= 31:
+        return False
+    if a == 192 and b == 168:
+        return False
+    if a == 169 and b == 254:
+        return False
+    return True
+
+
+def valid_public_address(text: str) -> Optional[str]:
+    """Return "host:port" when `text` is a usable public address, else None.
+
+    Used to validate the explicit ``PLAYIT_PUBLIC_ADDRESS`` override so a typo
+    (or a loopback/private address) can never be shown as the join address.
+    """
+    if not isinstance(text, str):
+        return None
+    m = re.fullmatch(r'([A-Za-z0-9][A-Za-z0-9.-]*):(\d{1,5})', text.strip())
+    if not m:
+        return None
+    host, port = m.group(1), m.group(2)
+    if _IPV4_RE.match(host):
+        if not _is_public_ipv4(host):
+            return None
+    elif "." not in host:
+        return None
+    return f"{host}:{port}"
+
 
 def clear_public_address() -> None:
     """Start a fresh address record for a new connector.
@@ -154,14 +210,18 @@ def _scan_log_for_address() -> Optional[str]:
 
 
 def read_public_address() -> Optional[str]:
-    """The public address the connector last reported, as "host:port", or None.
+    """The public address to show, as "host:port", or None.
 
-    File first (fast, written the moment the address is seen), then the
-    connector log, so a re-run of the notebook cell still reports the same real
-    address. Returns None — never a placeholder — when no real address has been
-    reported, so the panel keeps saying "address unknown" instead of showing a
-    wrong one.
+    Precedence: the explicit `PLAYIT_PUBLIC_ADDRESS` override (the reliable fix
+    when the connector's output cannot be parsed), then the file written the
+    moment the address was seen, then the connector log (so a re-run of the cell
+    or another starter instance still reports the same real address). Returns
+    None — never a placeholder — when no real address is known, so the panel
+    keeps saying "address unknown" instead of showing a wrong one.
     """
+    override = valid_public_address(os.environ.get(PLAYIT_ADDRESS_VAR, ""))
+    if override:
+        return override
     return _read_recorded_address() or _scan_log_for_address()
 
 
@@ -534,10 +594,27 @@ class PlayitTunnel:
         A port is REQUIRED. A missing port must never be filled in with a
         guess, because that sends players to an address nobody is listening on.
         """
+        # A Playit-owned hostname is unambiguous wherever it appears.
         match = re.search(self.ADDRESS_PATTERN, line, re.IGNORECASE)
-        if not match:
+        if match:
+            return match.group(1), match.group(2)
+
+        # Otherwise only trust a host:port on a line that names it as the
+        # address: Playit in "show IPs instead of domains" mode prints a bare
+        # public IP, and custom domains are possible. Requiring the label keeps
+        # the tunnel-server IP and the local 127.0.0.1 target out.
+        lowered = line.lower()
+        if not any(label in lowered for label in _ADDRESS_LABELS):
             return None
-        return match.group(1), match.group(2)
+        for m in _HOST_PORT_RE.finditer(line):
+            host, port = m.group(1), m.group(2)
+            if _IPV4_RE.match(host):
+                if _is_public_ipv4(host):
+                    return host, port
+                continue
+            if "." in host:  # a dotted hostname: custom or Playit domain
+                return host, port
+        return None
 
     def _remember_address(self, address: Tuple[str, str]) -> None:
         """Record a real address in memory *and* in the shared file.

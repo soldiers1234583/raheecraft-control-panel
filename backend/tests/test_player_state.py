@@ -19,6 +19,7 @@ that spans the whole session.
 """
 
 import os
+import shutil
 import sys
 import tempfile
 import unittest
@@ -63,6 +64,14 @@ def _make_server(root: str) -> Path:
     for name in ("ops.json", "whitelist.json", "banned-players.json",
                  "usercache.json"):
         (root / name).write_text("[]")
+
+    # User-uploaded plugins: the JAR and the data that belongs to it, plus a
+    # transient log that must never be archived.
+    (root / "plugins" / "LuckPerms" / "logs").mkdir(parents=True)
+    (root / "plugins" / "LuckPerms.jar").write_bytes(b"JAR")
+    (root / "plugins" / "LuckPerms" / "config.yml").write_text("server: survival\n")
+    (root / "plugins" / "LuckPerms" / "data.db").write_bytes(b"DB")
+    (root / "plugins" / "LuckPerms" / "logs" / "luckperms.log").write_text("noise\n")
     return root
 
 
@@ -123,6 +132,36 @@ class TestBackupCapturesPlayerState(_TmpServer):
         self.assertEqual(root_members, present)
 
 
+class TestBackupCapturesPlugins(_TmpServer):
+    """Plugin JARs and their data must survive into the next session."""
+
+    def test_plugin_jar_and_data_are_captured(self):
+        members = _zip_members(self.root, self._tmp.name)
+        self.assertIn("plugins/LuckPerms.jar", members)
+        self.assertIn("plugins/LuckPerms/config.yml", members)
+        self.assertIn("plugins/LuckPerms/data.db", members)
+
+    def test_plugin_logs_are_not_captured(self):
+        members = _zip_members(self.root, self._tmp.name)
+        self.assertNotIn("plugins/LuckPerms/logs/luckperms.log", members)
+        for member in members:
+            self.assertFalse(member.endswith(".log"), member)
+
+    def test_every_plugin_member_stays_under_plugins(self):
+        members = _zip_members(self.root, self._tmp.name)
+        plugin_members = [m for m in members if m.split("/")[0] == "plugins"]
+        self.assertTrue(plugin_members)
+        for member in plugin_members:
+            self.assertTrue(member == "plugins" or member.startswith("plugins/"),
+                            member)
+
+    def test_missing_plugins_directory_is_not_an_error(self):
+        shutil.rmtree(str(self.root / "plugins"))
+        members = _zip_members(self.root, self._tmp.name)
+        self.assertIn("ops.json", members)
+        self.assertFalse(any(m.startswith("plugins") for m in members))
+
+
 class TestChangeDetection(_TmpServer):
 
     def setUp(self):
@@ -157,6 +196,12 @@ class TestChangeDetection(_TmpServer):
         """Root state files must trigger a backup, not be ignored."""
         self._set_mtimes(OLD_MTIME)
         os.utime(str(self.root / "whitelist.json"), (NEW_MTIME, NEW_MTIME))
+        self.assertFalse(self.drive._worlds_unchanged(self.worlds, self.backup))
+
+    def test_a_newer_plugin_file_is_a_change(self):
+        self._set_mtimes(OLD_MTIME)
+        os.utime(str(self.root / "plugins" / "LuckPerms" / "config.yml"),
+                 (NEW_MTIME, NEW_MTIME))
         self.assertFalse(self.drive._worlds_unchanged(self.worlds, self.backup))
 
     def test_an_unparseable_timestamp_forces_a_backup(self):
