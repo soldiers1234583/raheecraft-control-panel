@@ -241,20 +241,21 @@ def check_playit_tunnel() -> tuple[bool, Optional[str]]:
 
 
 def get_drive_last_backup() -> Optional[str]:
-    """Get timestamp of last Google Drive backup."""
+    """Timestamp of the most recent backup, from whichever backend is set up.
+
+    Uses the shared factory so this reports Filebase backups too, not only
+    Google Drive ones.
+    """
     try:
         sys.path.insert(0, str(PROJECT_ROOT))
-        from drive_backup import GoogleDriveBackup
-        
-        drive = GoogleDriveBackup(dry_run=False)
-        backups = drive.list_backups()
-        
+        from drive_backup import get_backup_client
+
+        backups = get_backup_client(dry_run=False).list_backups()
         if backups:
-            # Return ISO timestamp
             return backups[0].get("modifiedTime")
     except Exception:
         pass
-    
+
     return None
 
 

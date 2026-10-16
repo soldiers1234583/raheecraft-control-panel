@@ -1000,6 +1000,25 @@ def test_backup_system(dry_run: bool = True):
     print("\n📋 Next: Run the actual backup in a live Kaggle session")
 
 
+def get_backup_client(dry_run: bool = False):
+    """The configured backup client, so callers need not know the backend.
+
+    Filebase is chosen whenever its access key and secret are present, because
+    it authenticates with plain keys while Google Drive needs an interactive
+    OAuth step that cannot run headless. Force one with
+    ``BACKUP_BACKEND=filebase`` or ``BACKUP_BACKEND=gdrive``.
+    """
+    choice = os.environ.get("BACKUP_BACKEND", "").strip().lower()
+    if choice == "gdrive":
+        return GoogleDriveBackup(dry_run=dry_run)
+    filebase_ready = bool(os.environ.get("FILEBASE_ACCESS_KEY", "").strip()
+                          and os.environ.get("FILEBASE_SECRET_KEY", "").strip())
+    if choice == "filebase" or filebase_ready:
+        from filebase_backup import FilebaseBackup  # lazy: avoids an import cycle
+        return FilebaseBackup(dry_run=dry_run)
+    return GoogleDriveBackup(dry_run=dry_run)
+
+
 if __name__ == "__main__":
     # Test mode when run directly
     test_backup_system(dry_run=True)

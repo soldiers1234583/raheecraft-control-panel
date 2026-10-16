@@ -6,3 +6,7 @@ bottle==0.13.4
 
 # HTTP client (for agent communication)
 httpx==0.28.1
+
+# Filebase (S3-compatible) backups. Only needed when FILEBASE_* is configured;
+# Kaggle images already ship boto3.
+boto3>=1.34
