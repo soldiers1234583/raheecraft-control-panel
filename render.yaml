@@ -1,0 +1,36 @@
+# RaheeCraft Control Panel — Render Blueprint
+# https://render.com/dashboard/new?type=web
+#
+# One web service. The dashboard guide sets Root Directory = backend/ in the
+# Render UI, so build/start commands are relative to backend/.
+#
+# If you prefer Render to pick this up automatically from GitHub, keep this
+# file at the repo root and set Root Directory = backend in the service config.
+
+services:
+  - type: web
+    name: raheecraft-control-panel
+    env: python
+    plan: free
+    # Root Directory is set in the Render UI to "backend", so these commands
+    # run inside backend/.
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "python app.py"
+    envVars:
+      - key: HOST
+        value: 0.0.0.0
+      - key: PORT
+        value: 8080
+      - key: DEBUG
+        value: false
+      - key: SESSION_SECURE
+        value: true
+      # SECRET_KEY and ADMIN_PASSWORD are set in the Render dashboard (not
+      # committed). On first start app.py hashes ADMIN_PASSWORD into
+      # ADMIN_PASSWORD_HASH and stores it in memory.
+    healthCheckPath: /health
+    healthCheckTimeout: 10
+    healthCheckInterval: 30
+    autoDeploy: true
+    maxInstances: 1
+    memory: 512

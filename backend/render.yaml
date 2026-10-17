@@ -1,23 +1,21 @@
 # RaheeCraft Control Panel - Render Deployment
 # https://render.com/dashboard/new?type=web
+#
+# This file also lives at the repo root as render.yaml so Render can auto-
+# detect the blueprint from GitHub. If you create the service from the UI
+# instead, set Root Directory = backend and use these commands:
+#   Build:  pip install -r requirements.txt
+#   Start:  python app.py
 
 services:
   - type: web
     name: raheecraft-control-panel
     env: python
     plan: free
-    
-    # Build command - install dependencies
-    buildCommand: "pip install -r backend/requirements.txt"
-    
-    # Start command - run the backend
-    startCommand: "python backend/app.py"
-    
-    # Environment variables (set in Render dashboard, NOT in this file)
-    # - SECRET_KEY: Session signing key (auto-generated if not set)
-    # - ADMIN_PASSWORD: Admin login password
-    # - BACKEND_URL: (for agent communication, set if needed)
-    
+    # Root Directory is set in the Render UI to "backend", so these commands
+    # run inside backend/.
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "python app.py"
     envVars:
       - key: HOST
         value: 0.0.0.0
@@ -27,27 +25,9 @@ services:
         value: false
       - key: SESSION_SECURE
         value: true
-    
-    # Routes
-    routes:
-      - type: path
-        path: /
-        target: /
-      - type: path
-        path: /api/*
-        target: /api/*
-      - type: path
-        path: /static/*
-        target: /static/*
-    
-    # Health check
     healthCheckPath: /health
     healthCheckTimeout: 10
     healthCheckInterval: 30
-    
-    # Auto-deploy on git push
     autoDeploy: true
-    
-    # Additional configuration
     maxInstances: 1
     memory: 512
